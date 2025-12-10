@@ -1,4 +1,5 @@
 import json
+import shutil
 import os
 from collections import defaultdict
 from dataclasses import asdict
@@ -10,7 +11,8 @@ import jsonlines
 import numpy as np
 import torch
 import wandb
-from accelerate import Accelerator, InitProcessGroupKwargs
+from accelerate import Accelerator, InitProcessGroupKwargs, DistributedDataParallelKwargs, DeepSpeedPlugin
+
 from accelerate.utils import broadcast, gather_object
 from agentenv.controller import Agent
 from agentenv.controller.agent import Agent
@@ -20,7 +22,8 @@ from agentenv.trainer.utils import set_seed
 from datasets import Dataset, DatasetDict
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-from transformers import AdamW, GenerationConfig, get_linear_schedule_with_warmup
+from torch.optim import AdamW
+from transformers import GenerationConfig, get_linear_schedule_with_warmup
 
 
 class BCTrainer(BaseTrainer):
@@ -58,10 +61,77 @@ class BCTrainer(BaseTrainer):
         """
         Create the accelerator.
         """
-        self.accelerator = Accelerator(
-            gradient_accumulation_steps=self.args["gradient_accumulation_steps"],
-            kwargs_handlers=[InitProcessGroupKwargs(timeout=timedelta(seconds=18000))],
-        )  # wait for processing upto 5hrs
+        common_kwargs = [InitProcessGroupKwargs(timeout=timedelta(seconds=18000))]
+        if self.args.get("use_deepspeed", False):
+            # 使用 ZeRO-3 + torch_adam，避免编译自定义算子以及 CUDA 版本不匹配
+            ds_config = {
+                "train_micro_batch_size_per_gpu": self.args["batch_size"],
+                "gradient_accumulation_steps": self.args["gradient_accumulation_steps"],
+                "zero_optimization": {
+                    "stage": 3,
+                    "overlap_comm": True,
+                    "contiguous_gradients": True,
+                    # 启用优化器状态 CPU offload 缓解显存压力
+                    "offload_optimizer": {"device": "cpu", "pin_memory": True},
+                    "offload_param": {"device": "none"},
+                    # 允许保存时聚合 16bit 权重，便于 unwrap 并保存
+                    "gather_16bit_weights_on_model_save": True,
+                },
+                # 根据 torch_dtype 自动选择 bf16
+                "bf16": {"enabled": True},
+                "fp16": {"enabled": False},
+                # 激活检查点：用算力换显存，显著降低长序列下的激活占用
+                "activation_checkpointing": {
+                    "partition_activations": True,
+                    "contiguous_memory_optimization": False,
+                    "cpu_checkpointing": True,
+                    "number_checkpoints": None,
+                    "synchronize_checkpoint_boundary": False,
+                    "profile": False
+                },
+                # 顶层启用 torch_adam，强制使用 torch.optim 以避免自定义算子编译
+                "torch_adam": True,
+                # 强制使用 PyTorch 原生 Adam（AdamW 模式），避免 FusedAdam/CPUAdam 编译
+                "optimizer": {
+                    "type": "Adam",
+                    "params": {
+                        "lr": self.args["learning_rate"],
+                        "betas": [0.9, 0.999],
+                        "eps": 1e-8,
+                        "weight_decay": self.args["weight_decay"],
+                        "adam_w_mode": True
+                    }
+                },
+                "gradient_clipping": float(self.args.get("clip_grad_norm", 1.0)),
+                "aio": {"enabled": False},
+                "steps_per_print": 0,
+                "wall_clock_breakdown": False,
+            }
+            ds_plugin = DeepSpeedPlugin(
+                hf_ds_config=ds_config,
+                zero_stage=3,
+                gradient_accumulation_steps=self.args["gradient_accumulation_steps"],
+                gradient_clipping=float(self.args.get("clip_grad_norm", 1.0)),
+            )
+            self.accelerator = Accelerator(
+                gradient_accumulation_steps=self.args["gradient_accumulation_steps"],
+                kwargs_handlers=common_kwargs,
+                deepspeed_plugin=ds_plugin,
+            )
+            # 明确打印 DeepSpeed 状态，便于外部日志确认
+            try:
+                zero_stage = getattr(self.accelerator.state.deepspeed_plugin, "zero_stage", None)
+            except Exception:
+                zero_stage = None
+            self.accelerator.print(f"[Accelerate] DeepSpeed enabled: True | zero_stage={zero_stage} | grad_accum_steps={self.args['gradient_accumulation_steps']}")
+        else:
+            self.accelerator = Accelerator(
+                gradient_accumulation_steps=self.args["gradient_accumulation_steps"],
+                kwargs_handlers=common_kwargs + [
+                    DistributedDataParallelKwargs(find_unused_parameters=True)
+                ],
+            ) 
+            self.accelerator.print("[Accelerate] DeepSpeed enabled: False | Using DDP")
 
     def set_seed(self):
         """
@@ -73,27 +143,120 @@ class BCTrainer(BaseTrainer):
         """
         Setup the tokenizer.
         """
-        self.agent.tokenizer.pad_token_id = 0
-        self.agent.tokenizer.eos_token_id = 2
-        self.accelerator.print(f"[Vocab size]: {len(self.agent.tokenizer)}")
-        self.agent.model.resize_token_embeddings(len(self.agent.tokenizer))
+        # Avoid hard-coding special token ids; only set when missing
+        try:
+            if getattr(self.agent.tokenizer, "pad_token_id", None) is None:
+                unk_id = getattr(self.agent.tokenizer, "unk_token_id", None)
+                eos_id = getattr(self.agent.tokenizer, "eos_token_id", None)
+                self.agent.tokenizer.pad_token_id = (
+                    unk_id if unk_id is not None else eos_id
+                )
+            if getattr(self.agent.tokenizer, "eos_token_id", None) is None:
+                if hasattr(self.agent.tokenizer, "convert_tokens_to_ids"):
+                    maybe_eos = self.agent.tokenizer.convert_tokens_to_ids("</s>")
+                    if isinstance(maybe_eos, int) and maybe_eos >= 0:
+                        self.agent.tokenizer.eos_token_id = maybe_eos
+        except Exception:
+            pass
+        # Robust vocab size handling for processors without __len__
+        tok = self.agent.tokenizer
+        vocab_size = None
+        if hasattr(tok, "vocab_size"):
+            vocab_size = tok.vocab_size
+        elif hasattr(tok, "get_vocab"):
+            try:
+                vocab_size = len(tok.get_vocab())
+            except Exception:
+                vocab_size = None
+        elif hasattr(tok, "tokenizer") and hasattr(tok.tokenizer, "vocab_size"):
+            vocab_size = tok.tokenizer.vocab_size
+        if vocab_size is None:
+            model_config = getattr(getattr(self.agent, "model", None), "config", None)
+            vocab_size = getattr(model_config, "vocab_size", None)
+
+        self.accelerator.print(
+            f"[Vocab size]: {vocab_size if vocab_size is not None else 'unknown'}"
+        )
+        # Only expand embeddings; never shrink to avoid OOB indices
+        try:
+            current_embed = None
+            try:
+                current_embed = (
+                    self.agent.model.get_input_embeddings().weight.shape[0]
+                )
+            except Exception:
+                pass
+            if (
+                vocab_size is not None
+                and isinstance(current_embed, int)
+                and vocab_size > current_embed
+            ):
+                self.agent.model.resize_token_embeddings(vocab_size)
+        except Exception:
+            pass
 
     def get_raw_dataset(self):
-        with self.accelerator.main_process_first():
+        # 在单进程/未初始化分布式的情况下，避免进入 barrier
+        if getattr(self.accelerator, "num_processes", 1) == 1:
+            from contextlib import nullcontext
+            mpf_ctx = nullcontext()
+        else:
+            mpf_ctx = self.accelerator.main_process_first()
+
+        with mpf_ctx:
+            def _load_list_from_path(path):
+                path = os.path.expanduser(path)
+                ext = os.path.splitext(path)[1].lower()
+                # JSONL family
+                if ext in [".jsonl", ".jsonlines", ".jl"]:
+                    items = []
+                    with jsonlines.open(path, mode="r") as reader:
+                        for obj in reader:
+                            if isinstance(obj, dict):
+                                items.append(obj)
+                    return items
+                # JSON
+                with open(path, "r", encoding="utf-8") as f:
+                    obj = json.load(f)
+                if isinstance(obj, list):
+                    return [x for x in obj if isinstance(x, dict)]
+                if isinstance(obj, dict):
+                    # Try common keys
+                    for key in ["data", "examples", "train", "inference", "test"]:
+                        v = obj.get(key)
+                        if isinstance(v, list):
+                            return [x for x in v if isinstance(x, dict)]
+                    # Fallback: first list value
+                    for v in obj.values():
+                        if isinstance(v, list):
+                            return [x for x in v if isinstance(x, dict)]
+                    raise ValueError(
+                        f"Unsupported JSON structure in {path}. Expected list[dict] or dict with a list field."
+                    )
+                raise ValueError(
+                    f"Unsupported file content in {path}. Expected JSON/JSONL containing list[dict]."
+                )
+
+            train_list = _load_list_from_path(self.args["train_file"])
+            infer_list = _load_list_from_path(self.args["inference_file"])
+            test_list = _load_list_from_path(self.args["test_file"])
+
+            # limit train samples for quick smoke test if specified
+            max_samples = self.args.get("train_max_samples")
+            if isinstance(max_samples, int) and max_samples > 0:
+                train_list = train_list[: max_samples]
+
             self.raw_dataset = DatasetDict(
                 {
-                    "train": Dataset.from_list(
-                        json.load(open(self.args["train_file"], "r"))
-                    ),
-                    "inference": Dataset.from_list(
-                        json.load(open(self.args["inference_file"], "r"))
-                    ),
-                    "test": Dataset.from_list(
-                        json.load(open(self.args["test_file"], "r"))
-                    ),
+                    "train": Dataset.from_list(train_list),
+                    "inference": Dataset.from_list(infer_list),
+                    "test": Dataset.from_list(test_list),
                 }
             )
-            self.accelerator.print("Raw data:", self.raw_dataset)
+            self.accelerator.print(
+                "Raw sizes:",
+                {k: len(v) for k, v in self.raw_dataset.items()},
+            )
 
     def get_train_dataloader(self):
         """
@@ -102,9 +265,11 @@ class BCTrainer(BaseTrainer):
 
         def tokenize_fn(batch, args, tokenizer):
             # tokenizer.chat_template = "{% if messages[0]['role'] == 'system' %}{% set loop_messages = messages[1:] %}{% set system_message = messages[0]['content'] %}{% else %}{% set loop_messages = messages %}{% set system_message = false %}{% endif %}{% for message in loop_messages %}{% if (message['role'] == 'user') != (loop.index0 % 2 == 0) %}{{ raise_exception('Conversation roles must alternate user/assistant/user/assistant/...') }}{% endif %}{% if loop.index0 == 0 and system_message != false %}{% set content = '<<SYS>>\\n' + system_message + '\\n<</SYS>>\\n\\n' + message['content'] %}{% else %}{% set content = message['content'] %}{% endif %}{% if message['role'] == 'user' %}{{ bos_token + '[INST] ' + content | trim + ' [/INST]' }}{% elif message['role'] == 'assistant' %}{{ ' '  + content | trim + ' ' + eos_token }}{% endif %}{% endfor %}"
-            assert tokenizer.eos_token_id is not None, (
-                tokenizer.eos_token_id,
-                tokenizer.eos_token,
+            # 使用内部 tokenizer 以兼容 Processor（如 Qwen2VLProcessor）
+            tok = getattr(tokenizer, "tokenizer", tokenizer)
+            assert getattr(tok, "eos_token_id", None) is not None, (
+                getattr(tok, "eos_token_id", None),
+                getattr(tok, "eos_token", None),
             )
             new_batch = defaultdict(list)
             all_keys = list(batch.keys())
@@ -118,19 +283,30 @@ class BCTrainer(BaseTrainer):
                 for message in conversations:
                     if message["from"] == "human":
                         text = f"<s>[INST] {message['value']} [/INST]"
-                        input_encode = tokenizer.encode(text, add_special_tokens=False)
+                        input_encode = tok.encode(text, add_special_tokens=False)
                         input_ids.extend(input_encode)
                         labels.extend([-100] * len(input_encode))
                     else:
                         # message["from"] == "gpt":
                         # text = f" {message['value']}</s>"
                         text = f" {message['value']}"
-                        input_encode = tokenizer.encode(text, add_special_tokens=False)
-                        input_encode += [tokenizer.eos_token_id]
+                        input_encode = tok.encode(text, add_special_tokens=False)
+                        input_encode += [tok.eos_token_id]
                         input_ids.extend(input_encode)
                         labels.extend(input_encode)
 
                 attention_mask = [1] * len(input_ids)
+
+                # Ensure non-empty sequence to avoid device-side assert in RoPE indexing
+                if len(input_ids) == 0:
+                    fallback_id = (
+                        getattr(tok, "eos_token_id", None)
+                        if getattr(tok, "eos_token_id", None) is not None
+                        else getattr(tok, "unk_token_id", 0)
+                    )
+                    input_ids = [fallback_id]
+                    labels = [-100]
+                    attention_mask = [1]
 
                 # Truncation
                 input_ids_max_length = len(input_ids)
@@ -159,7 +335,7 @@ class BCTrainer(BaseTrainer):
                     },
                     batched=True,
                     remove_columns=self.raw_dataset["train"].column_names,
-                    num_proc=8,
+                    num_proc=1,
                     load_from_cache_file=False,
                 )
             }
@@ -173,7 +349,6 @@ class BCTrainer(BaseTrainer):
 
         def collate_fn(batch, tokenizer):
             max_input_length = max([len(item["input_ids"]) for item in batch])
-            max_target_length = max([len(item["labels"]) for item in batch])
             input_ids = []
             attention_mask = []
             labels = []
@@ -189,12 +364,62 @@ class BCTrainer(BaseTrainer):
                     + [0] * (max_input_length - len(item["attention_mask"]))
                 )
                 labels.append(
-                    item["labels"] + [-100] * (max_target_length - len(item["labels"]))
+                    item["labels"] + [-100] * (max_input_length - len(item["labels"]))
                 )
+
+            # sanitize token ids to avoid out-of-range embedding indices
+            try:
+                # prefer model embedding size over tokenizer vocab size
+                model_embed_size = None
+                try:
+                    model_embed_size = self.agent.model.get_input_embeddings().weight.shape[0]
+                except Exception:
+                    model_embed_size = None
+
+                vsz = model_embed_size
+                if vsz is None:
+                    try:
+                        if hasattr(tokenizer, "__len__"):
+                            vsz = len(tokenizer)
+                    except Exception:
+                        vsz = None
+                if vsz is None and hasattr(tokenizer, "vocab_size"):
+                    vsz = tokenizer.vocab_size
+                if vsz is None and hasattr(tokenizer, "get_vocab"):
+                    try:
+                        vsz = len(tokenizer.get_vocab())
+                    except Exception:
+                        vsz = None
+                if vsz is None and hasattr(tokenizer, "tokenizer"):
+                    inner_tok = tokenizer.tokenizer
+                    try:
+                        if hasattr(inner_tok, "__len__"):
+                            vsz = len(inner_tok)
+                    except Exception:
+                        vsz = getattr(inner_tok, "vocab_size", None)
+
+                unk_id = getattr(tokenizer, "unk_token_id", 0) or 0
+                for seq in input_ids:
+                    for i, tid in enumerate(seq):
+                        if (tid is None) or (tid < 0) or (vsz is not None and tid >= int(vsz)):
+                            seq[i] = unk_id
+
+                # ensure at least one valid token per sequence for RoPE indexing
+                for i in range(len(attention_mask)):
+                    if sum(attention_mask[i]) <= 0:
+                        attention_mask[i][0] = 1
+                        if input_ids[i]:
+                            input_ids[i][0] = unk_id
+                        else:
+                            input_ids[i] = [unk_id]
+                            labels[i] = [-100]
+                            attention_mask[i] = [1] + attention_mask[i]
+            except Exception:
+                pass
 
             forward_kwargs = {
                 "input_ids": torch.LongTensor(input_ids),
-                "attention_mask": torch.BoolTensor(attention_mask),
+                "attention_mask": torch.LongTensor(attention_mask),
                 "labels": torch.LongTensor(labels),
             }
             return {"forward_kwargs": forward_kwargs}
@@ -221,7 +446,14 @@ class BCTrainer(BaseTrainer):
             }
             return result
 
-        with self.accelerator.main_process_first():
+        # 在单进程/未初始化分布式的情况下，避免进入 barrier
+        if getattr(self.accelerator, "num_processes", 1) == 1:
+            from contextlib import nullcontext
+            mpf_ctx = nullcontext()
+        else:
+            mpf_ctx = self.accelerator.main_process_first()
+
+        with mpf_ctx:
 
             self.inference_dataloader = DataLoader(
                 self.raw_dataset["inference"],
@@ -248,7 +480,8 @@ class BCTrainer(BaseTrainer):
         Set the wandb.
         """
         # os.environ["WANDB_MODE"] = "offline"
-        if torch.distributed.get_rank() == 0 and self.args["wandb_log"]:
+        # 使用 accelerate 的进程判断，避免在未初始化分布式时访问 torch.distributed
+        if self.accelerator.is_main_process and self.args["wandb_log"]:
             wandb.init(
                 project=self.args["wandb_project"],
                 name=self.args["wandb_run_name"],
@@ -256,12 +489,28 @@ class BCTrainer(BaseTrainer):
             wandb.config.update(self.args)
 
         if self.accelerator.is_main_process and self.args["wandb_log"]:
+            # compute vocab size robustly for logging
+            tok = self.agent.tokenizer
+            vocab_size = None
+            if hasattr(tok, "vocab_size"):
+                vocab_size = tok.vocab_size
+            elif hasattr(tok, "get_vocab"):
+                try:
+                    vocab_size = len(tok.get_vocab())
+                except Exception:
+                    vocab_size = None
+            elif hasattr(tok, "tokenizer") and hasattr(tok.tokenizer, "vocab_size"):
+                vocab_size = tok.tokenizer.vocab_size
+            if vocab_size is None:
+                model_config = getattr(getattr(self.agent, "model", None), "config", None)
+                vocab_size = getattr(model_config, "vocab_size", None)
+
             wandb.run.summary.update(
                 {
                     "pad_token_id": self.agent.tokenizer.pad_token_id,
                     "eos_token_id": self.agent.tokenizer.eos_token_id,
                     "unk_token_id": self.agent.tokenizer.unk_token_id,
-                    "vocab_size": len(self.agent.tokenizer),
+                    "vocab_size": vocab_size,
                 }
             )
 
@@ -269,13 +518,50 @@ class BCTrainer(BaseTrainer):
         os.makedirs(save_path, exist_ok=True)
 
         unwrapped_model = self.accelerator.unwrap_model(model)
-        unwrapped_model.save_pretrained(
-            save_path,
-            is_main_process=self.accelerator.is_main_process,
-            save_function=self.accelerator.save,
-            state_dict=self.accelerator.get_state_dict(model),
-        )
+        try:
+            state_dict = None
+            # 仅在模型仍为分布式/DeepSpeed 包装对象时使用 accelerator.get_state_dict
+            use_ds = getattr(self.accelerator.state, "deepspeed_plugin", None) is not None
+            if use_ds and hasattr(self.accelerator, "get_state_dict"):
+                try:
+                    state_dict = self.accelerator.get_state_dict(model)
+                except AttributeError:
+                    # 如果传入的是已解包的 HF 模型则跳过聚合，走常规保存
+                    state_dict = None
+            unwrapped_model.save_pretrained(
+                save_path,
+                is_main_process=self.accelerator.is_main_process,
+                save_function=self.accelerator.save,
+                state_dict=state_dict,
+            )
+        except ValueError:
+            # 当未启用 ZeRO-3 聚合保存选项时，退回保存 ZeRO checkpoint
+            if hasattr(model, "save_checkpoint"):
+                model.save_checkpoint(save_path)
+            else:
+                raise
         tokenizer.save_pretrained(save_path)
+
+        # 拷贝视觉/多模态处理器配置，便于评估阶段从 checkpoint 目录直接加载 AutoProcessor
+        try:
+            base_model_path = os.path.abspath(os.path.expanduser(self.args.get("model_train_path", "")))
+            if base_model_path and os.path.isdir(base_model_path):
+                candidates = [
+                    "preprocessor_config.json",
+                    "processor_config.json",
+                    "image_processor",
+                    "image_processor.json",
+                ]
+                for name in candidates:
+                    src = os.path.join(base_model_path, name)
+                    dst = os.path.join(save_path, name)
+                    if os.path.isfile(src) and not os.path.exists(dst):
+                        shutil.copy2(src, dst)
+                    elif os.path.isdir(src) and not os.path.exists(dst):
+                        shutil.copytree(src, dst)
+        except Exception:
+            # 非关键失败忽略
+            pass
 
     def init_train_stuff(self):
         """
@@ -311,14 +597,30 @@ class BCTrainer(BaseTrainer):
             },
         ]
 
-        self.optimizer = AdamW(
-            optimizer_grouped_parameters, lr=self.args["learning_rate"], eps=1e-8
-        )
-        self.scheduler = get_linear_schedule_with_warmup(
-            self.optimizer,
-            num_warmup_steps=warmup_step,
-            num_training_steps=num_training_steps,
-        )
+        # 若启用 DeepSpeed，则使用 DummyOptim/DummyScheduler，避免与 DS 配置冲突，并避免 CPUAdam 编译
+        use_ds = getattr(self.accelerator.state, "deepspeed_plugin", None) is not None
+        if use_ds:
+            from accelerate.utils.deepspeed import DummyOptim, DummyScheduler
+
+            self.optimizer = DummyOptim(
+                self.agent.model.parameters(),
+                lr=self.args["learning_rate"],
+                weight_decay=self.args["weight_decay"],
+            )
+            self.scheduler = DummyScheduler(
+                self.optimizer,
+                total_num_steps=num_training_steps,
+                warmup_num_steps=warmup_step,
+            )
+        else:
+            self.optimizer = AdamW(
+                optimizer_grouped_parameters, lr=self.args["learning_rate"], eps=1e-8
+            )
+            self.scheduler = get_linear_schedule_with_warmup(
+                self.optimizer,
+                num_warmup_steps=warmup_step,
+                num_training_steps=num_training_steps,
+            )
 
         self.accelerator.print(
             f"***** Running training *****\n"
@@ -374,7 +676,7 @@ class BCTrainer(BaseTrainer):
                             )
                     self.optimizer.step()
                     self.optimizer.zero_grad()
-                    if self.accelerator.sync_gradients:
+                    if self.accelerator.sync_gradients and hasattr(self.scheduler, "step"):
                         self.scheduler.step()
 
                 if self.accelerator.sync_gradients:
@@ -396,10 +698,15 @@ class BCTrainer(BaseTrainer):
                         }
 
                     if train_log_dict:
-                        log_dict = {
-                            "lr": self.scheduler.get_last_lr()[0],
-                            **train_log_dict,
-                        }
+                        log_dict = dict(train_log_dict)
+                        current_lr = None
+                        if hasattr(self.scheduler, "get_last_lr"):
+                            lrs = self.scheduler.get_last_lr()
+                            current_lr = (lrs[0] if isinstance(lrs, (list, tuple)) and lrs else lrs)
+                        elif hasattr(self.optimizer, "param_groups") and self.optimizer.param_groups:
+                            current_lr = self.optimizer.param_groups[0].get("lr")
+                        if current_lr is not None:
+                            log_dict["lr"] = current_lr
                         if self.accelerator.is_main_process and self.args["wandb_log"]:
                             wandb.log(log_dict, step=global_step)
                             log_dict = {
@@ -478,11 +785,18 @@ class BCTrainer(BaseTrainer):
 
                 if train_log_dict or eval_log_dict:
                     log_dict = {
-                        "lr": self.scheduler.get_last_lr()[0],
                         **train_log_dict,
                         **eval_log_dict,
                         **self.best_eval_log_dict,
                     }
+                    current_lr = None
+                    if hasattr(self.scheduler, "get_last_lr"):
+                        lrs = self.scheduler.get_last_lr()
+                        current_lr = (lrs[0] if isinstance(lrs, (list, tuple)) and lrs else lrs)
+                    elif hasattr(self.optimizer, "param_groups") and self.optimizer.param_groups:
+                        current_lr = self.optimizer.param_groups[0].get("lr")
+                    if current_lr is not None:
+                        log_dict["lr"] = current_lr
                     if self.accelerator.is_main_process and self.args["wandb_log"]:
                         wandb.log(log_dict, step=global_step)
                         log_dict = {
@@ -503,7 +817,6 @@ class BCTrainer(BaseTrainer):
                     # if is_best:
                     save_path = os.path.join(model_save_path, f"train_epoch_{epoch}")
                     self.save_model(self.agent.model, self.agent.tokenizer, save_path)
-                    self.agent.model = self.accelerator.unwrap_model(self.agent.model)
 
     def eval_test_dataloader(
         self,

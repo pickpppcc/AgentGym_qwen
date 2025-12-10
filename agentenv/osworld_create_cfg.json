@@ -1,0 +1,1 @@
+{\n  "provider_name": "docker",\n  "path_to_vm": "/data/pengchen/OSWorld/env/Ubuntu.qcow2",\n  "snapshot_name": "init_state",\n  "action_space": "computer_13",\n  "require_a11y_tree": false,\n  "require_terminal": false,\n  "headless": true\n}

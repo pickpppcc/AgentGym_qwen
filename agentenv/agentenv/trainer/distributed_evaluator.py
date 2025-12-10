@@ -18,7 +18,8 @@ from agentenv.trainer.utils import set_seed
 from datasets import Dataset, DatasetDict
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-from transformers import AdamW, GenerationConfig
+from torch.optim import AdamW
+from transformers import GenerationConfig
 
 
 class DistributedEvaluator(BaseTrainer):
@@ -56,22 +57,104 @@ class DistributedEvaluator(BaseTrainer):
     def setup_tokenizer(self):
         """
         Setup the tokenizer.
+        Avoid overriding model-specific special tokens.
         """
-        self.agent.tokenizer.pad_token_id = 0
-        self.agent.tokenizer.eos_token_id = 2
-        self.accelerator.print(f"[Vocab size]: {len(self.agent.tokenizer)}")
-        self.agent.model.resize_token_embeddings(len(self.agent.tokenizer))
+        try:
+            if getattr(self.agent.tokenizer, "pad_token_id", None) is None:
+                unk_id = getattr(self.agent.tokenizer, "unk_token_id", None)
+                eos_id = getattr(self.agent.tokenizer, "eos_token_id", None)
+                self.agent.tokenizer.pad_token_id = unk_id if unk_id is not None else eos_id
+            if getattr(self.agent.tokenizer, "eos_token_id", None) is None:
+                if hasattr(self.agent.tokenizer, "convert_tokens_to_ids"):
+                    maybe_eos = self.agent.tokenizer.convert_tokens_to_ids("</s>")
+                    if isinstance(maybe_eos, int) and maybe_eos >= 0:
+                        self.agent.tokenizer.eos_token_id = maybe_eos
+        except Exception:
+            pass
+        # Handle processors without __len__ (e.g., Qwen2VLProcessor)
+        tok = self.agent.tokenizer
+        vocab_size = None
+        # Prefer len(tokenizer) to include added tokens if available
+        try:
+            if hasattr(tok, "__len__"):
+                vocab_size = len(tok)
+        except Exception:
+            vocab_size = None
+        if vocab_size is None and hasattr(tok, "vocab_size"):
+            vocab_size = tok.vocab_size
+        if vocab_size is None and hasattr(tok, "get_vocab"):
+            try:
+                vocab_size = len(tok.get_vocab())
+            except Exception:
+                vocab_size = None
+        if vocab_size is None and hasattr(tok, "tokenizer"):
+            inner_tok = tok.tokenizer
+            try:
+                if hasattr(inner_tok, "__len__"):
+                    vocab_size = len(inner_tok)
+            except Exception:
+                vocab_size = getattr(inner_tok, "vocab_size", None)
+        if vocab_size is None:
+            model_config = getattr(getattr(self.agent, "model", None), "config", None)
+            vocab_size = getattr(model_config, "vocab_size", None)
+
+        self.accelerator.print(
+            f"[Vocab size]: {vocab_size if vocab_size is not None else 'unknown'}"
+        )
+        # Only expand embeddings; never shrink to avoid OOB indices
+        try:
+            current_embed = None
+            try:
+                current_embed = (
+                    self.agent.model.get_input_embeddings().weight.shape[0]
+                )
+            except Exception:
+                pass
+            if (
+                vocab_size is not None
+                and isinstance(current_embed, int)
+                and vocab_size > current_embed
+            ):
+                self.agent.model.resize_token_embeddings(vocab_size)
+        except Exception:
+            pass
 
     def get_raw_dataset(self):
         with self.accelerator.main_process_first():
-            self.raw_dataset = DatasetDict(
-                {
-                    "inference": Dataset.from_list(
-                        json.load(open(self.args["inference_file"], "r"))
-                    ),
-                }
-            )
-            self.accelerator.print("Raw data:", self.raw_dataset)
+            path = os.path.expanduser(self.args["inference_file"])
+            ext = os.path.splitext(path)[1].lower()
+            records = []
+            if ext in [".jsonl", ".jsonlines", ".jl"]:
+                with jsonlines.open(path, mode="r") as reader:
+                    for obj in reader:
+                        if isinstance(obj, dict):
+                            records.append(obj)
+            else:
+                with open(path, "r", encoding="utf-8") as f:
+                    obj = json.load(f)
+                if isinstance(obj, list):
+                    for it in obj:
+                        if isinstance(it, dict):
+                            records.append(it)
+                elif isinstance(obj, dict):
+                    # Flatten dict-of-lists. If list elements are dicts, keep them;
+                    # if elements are strings/IDs, we only need the count for indexing.
+                    tmp = []
+                    for v in obj.values():
+                        if isinstance(v, list):
+                            if v and isinstance(v[0], dict):
+                                tmp.extend([x for x in v if isinstance(x, dict)])
+                            else:
+                                tmp.extend([{"_raw_id": x} for x in v if isinstance(x, (str, int))])
+                    records = tmp
+
+            # Minimal dataset: evaluator只用到 item_id 的索引后缀，构造占位 item_id
+            items = []
+            for i, _ in enumerate(records):
+                items.append({"item_id": f"{self.args['task_name']}_{i}"})
+
+            self.raw_dataset = DatasetDict({"inference": Dataset.from_list(items)})
+            self.accelerator.print("Raw data:", {k: len(v) for k, v in self.raw_dataset.items()})
 
     def get_inference_dataloader(self):
         def collate_fn(batch):
@@ -114,17 +197,41 @@ class DistributedEvaluator(BaseTrainer):
         ):
             data_idxs = batch["data_idxs"]
             with torch.no_grad():
+                # Robustly resolve eos/pad ids to support processors (e.g., Qwen2VLProcessor)
+                eos_id = None
+                pad_id = None
+                gen_cfg = getattr(self.agent.model, "generation_config", None)
+                if gen_cfg is not None:
+                    eos_id = getattr(gen_cfg, "eos_token_id", None)
+                    pad_id = getattr(gen_cfg, "pad_token_id", None)
+
+                tok = getattr(self.agent, "tokenizer", None)
+                def _get(obj, name):
+                    return getattr(obj, name, None) if obj is not None else None
+
+                if eos_id is None:
+                    eos_id = _get(tok, "eos_token_id")
+                    if eos_id is None and _get(tok, "tokenizer") is not None:
+                        eos_id = _get(tok.tokenizer, "eos_token_id")
+
+                if pad_id is None:
+                    pad_id = _get(tok, "pad_token_id")
+                    if pad_id is None and _get(tok, "tokenizer") is not None:
+                        pad_id = _get(tok.tokenizer, "pad_token_id")
+                    if pad_id is None:
+                        # Fallback to unk -> eos
+                        unk_id = _get(tok, "unk_token_id") or (
+                            _get(_get(tok, "tokenizer"), "unk_token_id") if tok is not None else None
+                        )
+                        pad_id = unk_id if unk_id is not None else eos_id
+
                 exps = self.eval(
                     generation_config=GenerationConfig(
                         max_length=4096,
                         do_sample=self.args["do_sample"],
                         temperature=self.args["temperature"],
-                        eos_token_id=self.agent.tokenizer.eos_token_id,
-                        pad_token_id=(
-                            self.agent.tokenizer.pad_token_id
-                            if self.agent.tokenizer.pad_token_id is not None
-                            else self.agent.tokenizer.unk_token_id
-                        ),
+                        eos_token_id=eos_id,
+                        pad_token_id=pad_id,
                     ),
                     max_rounds=self.args["max_round"],
                     idxs=data_idxs,

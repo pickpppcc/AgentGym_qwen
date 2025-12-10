@@ -130,7 +130,11 @@ cd ./AgentGym
 
 cd agentenv
 pip install -e .
+conda install --override-channels -c nvidia -c defaults \
+  cuda-toolkit=12.4 cuda-nvcc=12.4 -y --repodata-fn repodata.json
 ```
+docker ps -aq --filter "ancestor=happysixd/osworld-docker" | xargs -r docker stop
+docker ps -aq --filter "ancestor=happysixd/osworld-docker" | xargs -r docker rm -v
 
 Depending on which environments you want to use, `cd` into the corresponding `agentenv-*` folder and follow the `README.md` inside.
 
@@ -139,7 +143,7 @@ Depending on which environments you want to use, `cd` into the corresponding `ag
 - Evaluation: [01-evaluation](https://github.com/WooooDyy/AgentGym/blob/main/docs/tutorials/en/01-evaluation.md)
 - Behavioral Cloning: [02-behavioral-cloning](https://github.com/WooooDyy/AgentGym/blob/main/docs/tutorials/en/02-behavioral-cloning.md)
 - AgentEvol: [03-AgentEvol](https://github.com/WooooDyy/AgentGym/blob/main/docs/tutorials/en/03-AgentEvol.md)
-- Env Visualization: [04-Env-Visualization](https://github.com/WooooDyy/AgentGym/blob/main/docs/tutorials/en/04-Env-Visualization.md)
+- Env Visualization: [04-Env-Visualization](https://github.com/WooooDyy/AgentGym/blob/main/docs/tutorials/en/04zation.md)
 - 2nd Development: [05-2nd-Development](https://github.com/WooooDyy/AgentGym/blob/main/docs/tutorials/en/05-2nd-Development.md)
 
 ### Examples
@@ -178,3 +182,11 @@ Depending on which environments you want to use, `cd` into the corresponding `ag
       primaryClass={cs.AI}
 }
 ```
+
+cd /data/pengchen/OSWorld/Osworld
+tar -czf /data/pengchen/osworld_subset_$(date +%F).tar.gz \
+  AgentGym OSWorld \
+  --exclude='OSWorld/logs' --exclude='OSWorld/logs/*' \
+  --exclude='OSWorld/results/cache' --exclude='OSWorld/results/cache/*'
+
+conda env create -f environment.yml -n osworld.

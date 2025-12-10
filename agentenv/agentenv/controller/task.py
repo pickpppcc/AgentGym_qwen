@@ -40,7 +40,7 @@ class BaseTask:
         done = False
         state = client.observe()
         if isinstance(agent, Agent):
-            tokenizer = agent.tokenizer
+            tokenizer = getattr(agent.tokenizer, "tokenizer", agent.tokenizer)
             conversation = list(client.conversation_start)
             conversation.append(
                 ConversationMessage({"from": "human", "loss": None, "value": state})
@@ -70,17 +70,24 @@ class BaseTask:
                     print(e)
                     break  # break if generate method raises exceptions
 
-                if generated_tokens[-1] != tokenizer.eos_token_id:
-                    generated_tokens += [tokenizer.eos_token_id]
+                eos_id = getattr(getattr(agent.model, "generation_config", None), "eos_token_id", None)
+                if eos_id is None:
+                    eos_id = getattr(tokenizer, "eos_token_id", None)
+                if generated_tokens[-1] != eos_id and eos_id is not None:
+                    generated_tokens += [eos_id]
 
                 generated_text = tokenizer.decode(generated_tokens)
                 conversation_tokenized["text"] += f" {generated_text}"
                 conversation_tokenized["input_ids"] += generated_tokens
                 conversation_tokenized["action_mask"] += [1] * len(generated_tokens)
 
-                generated_text = generated_text[
-                    : -len(tokenizer.eos_token)
-                ]  # not endswith eos_token
+                # 移除尾部 eos 文本（如存在）
+                try:
+                    eos_tok = getattr(tokenizer, "eos_token", None)
+                    if eos_tok and generated_text.endswith(eos_tok):
+                        generated_text = generated_text[: -len(eos_tok)]
+                except Exception:
+                    pass
                 conversation.append(
                     ConversationMessage(
                         {"from": "gpt", "loss": True, "value": generated_text}
@@ -88,6 +95,11 @@ class BaseTask:
                 )
             elif isinstance(agent, APIAgent):
                 generated_text, generated_reasoning_text = agent.generate(conversation)
+                if generated_reasoning_text:
+                    try:
+                        print(f"[Thought] {generated_reasoning_text}")
+                    except Exception:
+                        pass
                 conversation.append(
                     APIConversationMessage(
                         {"role": "assistant", "content": generated_text, "reasoning_content": generated_reasoning_text}

@@ -19,7 +19,8 @@ from agentenv.trainer.utils import set_seed
 from datasets import Dataset, DatasetDict
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-from transformers import AdamW, GenerationConfig, get_linear_schedule_with_warmup
+from torch.optim import AdamW
+from transformers import GenerationConfig, get_linear_schedule_with_warmup
 
 
 class AgentEvolTrainer(BaseTrainer):
@@ -74,10 +75,57 @@ class AgentEvolTrainer(BaseTrainer):
         """
         Setup the tokenizer.
         """
-        self.agent.tokenizer.pad_token_id = 0
-        self.agent.tokenizer.eos_token_id = 2
-        self.accelerator.print(f"[Vocab size]: {len(self.agent.tokenizer)}")
-        self.agent.model.resize_token_embeddings(len(self.agent.tokenizer))
+        # Avoid hard-coding special token ids; only set when missing
+        try:
+            if getattr(self.agent.tokenizer, "pad_token_id", None) is None:
+                unk_id = getattr(self.agent.tokenizer, "unk_token_id", None)
+                eos_id = getattr(self.agent.tokenizer, "eos_token_id", None)
+                self.agent.tokenizer.pad_token_id = (
+                    unk_id if unk_id is not None else eos_id
+                )
+            if getattr(self.agent.tokenizer, "eos_token_id", None) is None:
+                if hasattr(self.agent.tokenizer, "convert_tokens_to_ids"):
+                    maybe_eos = self.agent.tokenizer.convert_tokens_to_ids("</s>")
+                    if isinstance(maybe_eos, int) and maybe_eos >= 0:
+                        self.agent.tokenizer.eos_token_id = maybe_eos
+        except Exception:
+            pass
+        # Robust vocab size handling for processors without __len__
+        tok = self.agent.tokenizer
+        vocab_size = None
+        if hasattr(tok, "vocab_size"):
+            vocab_size = tok.vocab_size
+        elif hasattr(tok, "get_vocab"):
+            try:
+                vocab_size = len(tok.get_vocab())
+            except Exception:
+                vocab_size = None
+        elif hasattr(tok, "tokenizer") and hasattr(tok.tokenizer, "vocab_size"):
+            vocab_size = tok.tokenizer.vocab_size
+        if vocab_size is None:
+            model_config = getattr(getattr(self.agent, "model", None), "config", None)
+            vocab_size = getattr(model_config, "vocab_size", None)
+
+        self.accelerator.print(
+            f"[Vocab size]: {vocab_size if vocab_size is not None else 'unknown'}"
+        )
+        # Only expand embeddings; never shrink to avoid OOB indices
+        try:
+            current_embed = None
+            try:
+                current_embed = (
+                    self.agent.model.get_input_embeddings().weight.shape[0]
+                )
+            except Exception:
+                pass
+            if (
+                vocab_size is not None
+                and isinstance(current_embed, int)
+                and vocab_size > current_embed
+            ):
+                self.agent.model.resize_token_embeddings(vocab_size)
+        except Exception:
+            pass
 
     def get_raw_dataset(self):
         with self.accelerator.main_process_first():
@@ -238,12 +286,28 @@ class AgentEvolTrainer(BaseTrainer):
             wandb.config.update(self.args)
 
         if self.accelerator.is_main_process and self.args["wandb_log"]:
+            # compute vocab size robustly for logging
+            tok = self.agent.tokenizer
+            vocab_size = None
+            if hasattr(tok, "vocab_size"):
+                vocab_size = tok.vocab_size
+            elif hasattr(tok, "get_vocab"):
+                try:
+                    vocab_size = len(tok.get_vocab())
+                except Exception:
+                    vocab_size = None
+            elif hasattr(tok, "tokenizer") and hasattr(tok.tokenizer, "vocab_size"):
+                vocab_size = tok.tokenizer.vocab_size
+            if vocab_size is None:
+                model_config = getattr(getattr(self.agent, "model", None), "config", None)
+                vocab_size = getattr(model_config, "vocab_size", None)
+
             wandb.run.summary.update(
                 {
                     "pad_token_id": self.agent.tokenizer.pad_token_id,
                     "eos_token_id": self.agent.tokenizer.eos_token_id,
                     "unk_token_id": self.agent.tokenizer.unk_token_id,
-                    "vocab_size": len(self.agent.tokenizer),
+                    "vocab_size": vocab_size,
                 }
             )
 

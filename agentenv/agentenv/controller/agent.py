@@ -151,6 +151,11 @@ class Agent:
             if max_tokens == INF:
                 max_tokens = None
 
+            # Resolve eos id robustly (supports processors with nested tokenizer)
+            eos_id = getattr(self.tokenizer, "eos_token_id", None)
+            if eos_id is None and getattr(self.tokenizer, "tokenizer", None) is not None:
+                eos_id = getattr(self.tokenizer.tokenizer, "eos_token_id", None)
+
             generation_config = {
                 "repetition_penalty": generation_config.repetition_penalty,
                 "temperature": generation_config.temperature,
@@ -161,9 +166,9 @@ class Agent:
                 "early_stopping": generation_config.early_stopping,
                 "max_tokens": max_tokens,
                 "min_new_tokens": generation_config.min_new_tokens,
-                "stop_token_ids": [self.tokenizer.eos_token_id],
+                "stop_token_ids": [eos_id] if eos_id is not None else None,
             }
-            generation_config = {k: v for k, v in generation_config.items() if v}
+            generation_config = {k: v for k, v in generation_config.items() if v is not None}
             output = llm.generate(
                 # prompts=TokensPrompt(prompt_token_ids=input_ids),
                 prompt_token_ids=input_ids,
@@ -243,12 +248,13 @@ class Llama2Template(BaseChatTemplate):
         This function applied Llama Chat template on the given vicuna-styled conversation message.
         You can provide your own _tokenize_conversation_one to adapt to your own task.
         """
+        inner_tok = getattr(tokenizer, "tokenizer", tokenizer)
         if message["from"] == "human":
             text = f"<s>[INST] {message['value']} [/INST]"
-            input_ids = tokenizer.encode(text, add_special_tokens=False)
+            input_ids = inner_tok.encode(text, add_special_tokens=False)
         else:
             text = f"{message['value']}</s>"
-            input_ids = tokenizer.encode(text, add_special_tokens=False)
+            input_ids = inner_tok.encode(text, add_special_tokens=False)
             text = f" {text}"
         if message["loss"]:
             action_mask = [1] * len(input_ids)
@@ -280,21 +286,22 @@ class ChatMLTemplate(BaseChatTemplate):
             text = "<|im_start|>system\nYou are a helpful assistant<|im_end|>\n"
         else:
             text = ""
+        inner_tok = getattr(tokenizer, "tokenizer", tokenizer)
         if add_generation_prompt:
             if message["from"] == "human":
                 text += f"<|im_start|>user\n{message['value']}<|im_end|>\n<|im_start|>assistant\n"
-                input_ids = tokenizer.encode(text, add_special_tokens=False)
+                input_ids = inner_tok.encode(text, add_special_tokens=False)
             else:
                 text += f"{message['value']}<|im_end|>"
-                input_ids = tokenizer.encode(text, add_special_tokens=False)
+                input_ids = inner_tok.encode(text, add_special_tokens=False)
                 # text = f" {text}"
         else:
             if message["from"] == "human":
                 text += f"<|im_start|>user\n{message['value']}<|im_end|>\n"
-                input_ids = tokenizer.encode(text, add_special_tokens=False)
+                input_ids = inner_tok.encode(text, add_special_tokens=False)
             else:
                 text += f"<|im_start|>assistant\n{message['value']}<|im_end|>"
-                input_ids = tokenizer.encode(text, add_special_tokens=False)
+                input_ids = inner_tok.encode(text, add_special_tokens=False)
                 # text = f" {text}"
 
         if message["loss"]:
@@ -343,7 +350,8 @@ class Llama3Template(BaseChatTemplate):
             else:
                 text = f"<|start_header_id|>{mfrom}<|end_header_id|>\n\n{val}<|eot_id|>"
 
-        input_ids = tokenizer.encode(text, add_special_tokens=False)
+        inner_tok = getattr(tokenizer, "tokenizer", tokenizer)
+        input_ids = inner_tok.encode(text, add_special_tokens=False)
         if message["loss"]:
             action_mask = [1] * len(input_ids)
         else:
@@ -386,7 +394,8 @@ class ChatGLM4Template(BaseChatTemplate):
                 text = f"[gMASK]<sop><|{mfrom}|>\n{val}"
             else:
                 text = f"<|{mfrom}|>\n{val}"
-        input_ids = tokenizer.encode(text, add_special_tokens=False)
+        inner_tok = getattr(tokenizer, "tokenizer", tokenizer)
+        input_ids = inner_tok.encode(text, add_special_tokens=False)
         if message["loss"]:
             action_mask = [1] * len(input_ids)
         else:

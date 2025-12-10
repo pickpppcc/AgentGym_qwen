@@ -5,12 +5,12 @@ n_epochs='1'
 # accelerator config
 num_processes='8'
 main_process_port='8897'
-config_file=""
+config_file="/home/pengchen/.cache/huggingface/accelerate/default_config.yaml"
 
 # training arguments
-train_file='PATH/TO/mix_data_24110.json'
-inference_file='PATH/TO/webshop_test.json'
-model_train_path="meta-llama/Llama-2-7b-chat-hf"
+train_file='/data/pengchen/OSWorld/Osworld/OSWorld/evaluation_examples/examples_ours/test_all_examples_ours_train.json'
+inference_file='/data/pengchen/OSWorld/Osworld/OSWorld/evaluation_examples/examples_ours/test_all_examples_ours_val.json'
+model_train_path="/data/pengchen/OSWorld/Osworld/models/Qwen2-VL-2B"
 model_save_path="outputs/${exp_name}/"
 
 batch_size="2"
@@ -39,9 +39,11 @@ data_len="200"
 timeout="2400"
 
 # eval
-task_list=("webshop" "alfworld" "textcraft" "sciworld")
-# eval parameters
-test_file_list=("PATH/TO/webshop_test.json" "PATH/TO/alfworld_test.json" "PATH/TO/textcraft_test.json" "PATH/TO/sciworld_test_small.json")
+task_list=("osworld")
+test_file_list=("/data/pengchen/OSWorld/Osworld/OSWorld/evaluation_examples/test_small.json")
+# task_list=("webshop" "alfworld" "textcraft" "sciworld")
+# # eval parameters
+# test_file_list=("PATH/TO/webshop_test.json" "PATH/TO/alfworld_test.json" "PATH/TO/textcraft_test.json" "PATH/TO/sciworld_test_small.json")
 do_sample="False"
 temperature="1.0"
 sample_num="2"
@@ -49,7 +51,7 @@ max_round_list=("6" "30" "20" "30")
 env_server_base_list=("http://127.0.0.1:36004" "http://127.0.0.1:36002" "http://127.0.0.1:36008" "http://127.0.0.1:36010")
 
 mkdir -p "${model_save_path}"
-# step1: train
+# step1: train         # --config_file "${config_file}" \
 accelerate launch \
         --config_file "${config_file}" \
         --num_processes=${num_processes} \
