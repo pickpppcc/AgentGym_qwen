@@ -44,8 +44,35 @@ class OSWorldEnvClient(BaseEnvClient):
         self._current_task_id: str | None = None
         self._step_index: int = 0
 
-        ok = requests.post(f"{self.env_server_base}/create", json=create_cfg or {}, timeout=self.timeout)
-        ok.raise_for_status()
+        # 创建 OSWorld 环境实例；若后端返回 500 等错误，尽量把服务端返回的报错信息打出来，方便排查。
+        try:
+            ok = requests.post(
+                f"{self.env_server_base}/create",
+                json=create_cfg or {},
+                timeout=self.timeout,
+            )
+            ok.raise_for_status()
+        except requests.HTTPError as e:
+            # 把状态码、返回文本和当前 create_cfg 打印出来，便于用户定位是 server 端哪个参数不对
+            body = None
+            status = None
+            try:
+                status = ok.status_code  # type: ignore[name-defined]
+                body = ok.text           # type: ignore[name-defined]
+            except Exception:
+                body = None
+            debug_msg = (
+                f"[OSWorldEnvClient] /create failed with HTTP {status}: {body}\n"
+                f"  env_server_base={self.env_server_base}\n"
+                f"  create_cfg={json.dumps(create_cfg or {}, ensure_ascii=False)}"
+            )
+            # 直接打印到控制台；同时抛出更有信息量的异常
+            try:
+                print(debug_msg)
+            except Exception:
+                pass
+            raise RuntimeError(debug_msg) from e
+
         j = ok.json()
         self.env_id = j["id"]
         self.info: dict[str, Any] | None = None

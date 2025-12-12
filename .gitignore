@@ -165,3 +165,5 @@ agent-osworld/docker_vm_data/
 agentenv/logs/
 agentenv/wandb/
 *.logs
+data/
+agentenv/outputs/

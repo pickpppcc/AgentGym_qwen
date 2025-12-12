@@ -5,7 +5,10 @@ from collections import defaultdict
 from dataclasses import asdict
 from datetime import timedelta
 from functools import partial
-from typing import Sequence
+from typing import Sequence, Optional
+
+from io import BytesIO
+import base64
 
 import jsonlines
 import numpy as np
@@ -19,18 +22,38 @@ from agentenv.controller.agent import Agent
 from agentenv.controller.task import BaseTask
 from agentenv.controller.utils import BaseTrainer
 from agentenv.trainer.utils import set_seed
+from agentenv.trainer.collate_qwen_vl_assistant_only import (
+    collate_qwen_vl_assistant_only,
+)
 from datasets import Dataset, DatasetDict
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 from torch.optim import AdamW
 from transformers import GenerationConfig, get_linear_schedule_with_warmup
 
+try:
+    from PIL import Image  # type: ignore[import]
+except Exception:
+    # Pillow 仅在 VL 多模态路径下才需要；若不存在则退化为纯文本训练。
+    Image = None
+
 
 class BCTrainer(BaseTrainer):
-    def __init__(self, agent: Agent, tasks: Sequence[BaseTask], args) -> None:
+    def __init__(
+        self,
+        agent: Agent,
+        tasks: Sequence[BaseTask],
+        args,
+        processor: Optional[object] = None,
+        is_vision_language: bool = False,
+    ) -> None:
         self.agent = agent
         self.tasks = tasks
         self.args = asdict(args)
+
+        # 多模态相关：VL 模型会传入 AutoProcessor 和标志位
+        self.processor = processor
+        self.is_vision_language = bool(is_vision_language and processor is not None)
 
         # data & loader
         self.train_dataset = None
@@ -263,7 +286,7 @@ class BCTrainer(BaseTrainer):
         create train_dataset and train_dataloader
         """
 
-        def tokenize_fn(batch, args, tokenizer):
+        def tokenize_fn(batch, args, tokenizer, processor=None, is_vision_language: bool = False):
             # tokenizer.chat_template = "{% if messages[0]['role'] == 'system' %}{% set loop_messages = messages[1:] %}{% set system_message = messages[0]['content'] %}{% else %}{% set loop_messages = messages %}{% set system_message = false %}{% endif %}{% for message in loop_messages %}{% if (message['role'] == 'user') != (loop.index0 % 2 == 0) %}{{ raise_exception('Conversation roles must alternate user/assistant/user/assistant/...') }}{% endif %}{% if loop.index0 == 0 and system_message != false %}{% set content = '<<SYS>>\\n' + system_message + '\\n<</SYS>>\\n\\n' + message['content'] %}{% else %}{% set content = message['content'] %}{% endif %}{% if message['role'] == 'user' %}{{ bos_token + '[INST] ' + content | trim + ' [/INST]' }}{% elif message['role'] == 'assistant' %}{{ ' '  + content | trim + ' ' + eos_token }}{% endif %}{% endfor %}"
             # 使用内部 tokenizer 以兼容 Processor（如 Qwen2VLProcessor）
             tok = getattr(tokenizer, "tokenizer", tokenizer)
@@ -273,6 +296,8 @@ class BCTrainer(BaseTrainer):
             )
             new_batch = defaultdict(list)
             all_keys = list(batch.keys())
+            use_vl = bool(is_vision_language and processor is not None)
+
             for item_values in zip(*(batch[k] for k in all_keys)):
                 item = {k: item_values[i] for i, k in enumerate(all_keys)}
                 item_id, conversations = (item["item_id"], item["conversations"])
@@ -280,20 +305,58 @@ class BCTrainer(BaseTrainer):
                 input_ids = []
                 labels = []
 
+                # 对于 VL 模型，我们尝试从对话中解析 screenshot_base64，
+                # 将它解码成图像，后续交给 AutoProcessor 生成 pixel_values。
+                vl_images = []
+
                 for message in conversations:
+                    raw_val = message["value"]
+                    text_val = raw_val
+                    screenshot_b64 = None
+
+                    if use_vl and isinstance(raw_val, str) and raw_val.strip().startswith("{"):
+                        # 尝试解析嵌套 JSON，形如 {"instruction": ..., "step_text": ..., "screenshot_base64": ...}
+                        try:
+                            inner = json.loads(raw_val)
+                            if isinstance(inner, dict):
+                                instr = inner.get("instruction") or ""
+                                step_text = inner.get("step_text") or ""
+                                # 只保留与任务相关的文本，避免把整段巨大 JSON 直接当成 prompt
+                                merged_txt = (str(instr).strip() + "\n" + str(step_text).strip()).strip()
+                                if merged_txt:
+                                    text_val = merged_txt
+                                screenshot_b64 = inner.get("screenshot_base64")
+                        except Exception:
+                            pass
+
+                    # 文本 token 化逻辑保持原样，只是用 text_val 替代原始 value
                     if message["from"] == "human":
-                        text = f"<s>[INST] {message['value']} [/INST]"
+                        text = f"<s>[INST] {text_val} [/INST]"
                         input_encode = tok.encode(text, add_special_tokens=False)
                         input_ids.extend(input_encode)
                         labels.extend([-100] * len(input_encode))
                     else:
                         # message["from"] == "gpt":
                         # text = f" {message['value']}</s>"
-                        text = f" {message['value']}"
+                        text = f" {text_val}"
                         input_encode = tok.encode(text, add_special_tokens=False)
                         input_encode += [tok.eos_token_id]
                         input_ids.extend(input_encode)
                         labels.extend(input_encode)
+
+                    # 仅在 VL 模式且存在 screenshot_base64 时，尝试解码图像
+                    if use_vl and screenshot_b64 and Image is not None:
+                        try:
+                            b64_str = str(screenshot_b64)
+                            # 兼容 data:image/...;base64,xxx 形式
+                            if "," in b64_str and b64_str.strip().startswith("data:"):
+                                b64_str = b64_str.split(",", 1)[-1]
+                            img_bytes = base64.b64decode(b64_str)
+                            img = Image.open(BytesIO(img_bytes)).convert("RGB")
+                            vl_images.append(img)
+                        except Exception:
+                            # 解码失败则忽略该帧
+                            pass
 
                 attention_mask = [1] * len(input_ids)
 
@@ -319,6 +382,33 @@ class BCTrainer(BaseTrainer):
                 new_batch["input_ids"].append(input_ids)
                 new_batch["labels"].append(labels)
                 new_batch["attention_mask"].append(attention_mask)
+
+                # 多模态：目前简单地使用“最后一帧截图”作为该样本对应的图像输入，
+                # 后续在 collate_fn 中堆叠成 batch，并连同 image_grid_thw 一起传给模型。
+                if use_vl and vl_images:
+                    try:
+                        last_img = vl_images[-1]
+                        img_processor = getattr(processor, "image_processor", processor)
+                        # 使用 Qwen2VLImageProcessor 直接对单张图像做预处理，得到：
+                        # - pixel_values: [num_patches, dim]
+                        # - image_grid_thw: [1, 3]，记录该图像在视觉网格上的 (T, H, W)
+                        proc_outputs = img_processor(images=last_img, return_tensors="pt")
+                        pv = proc_outputs["pixel_values"].numpy().tolist()
+                        grid = proc_outputs.get("image_grid_thw", None)
+                        grid_list = (
+                            grid.numpy().tolist() if grid is not None else None
+                        )
+                        new_batch["pixel_values"].append(pv)
+                        new_batch["image_grid_thw"].append(grid_list)
+                    except Exception:
+                        # processor 失败时，不终止整个 batch 的处理
+                        new_batch["pixel_values"].append(None)
+                        new_batch["image_grid_thw"].append(None)
+                elif use_vl:
+                    # 统一字段结构：即便没有图像，也补一个占位，以便后续逻辑判断
+                    new_batch["pixel_values"].append(None)
+                    new_batch["image_grid_thw"].append(None)
+
                 ##
                 new_batch["item_id"].append(item_id)
                 new_batch["input_ids_max_length"].append(input_ids_max_length)
@@ -332,10 +422,12 @@ class BCTrainer(BaseTrainer):
                     fn_kwargs={
                         "args": self.args,
                         "tokenizer": self.agent.tokenizer,
+                        "processor": self.processor,
+                        "is_vision_language": self.is_vision_language,
                     },
                     batched=True,
                     remove_columns=self.raw_dataset["train"].column_names,
-                    num_proc=1,
+                    num_proc=4,
                     load_from_cache_file=False,
                 )
             }
@@ -347,7 +439,7 @@ class BCTrainer(BaseTrainer):
                 max(dataset["input_ids_max_length"]),
             )
 
-        def collate_fn(batch, tokenizer):
+        def collate_fn(batch, tokenizer, processor=None, is_vision_language: bool = False):
             max_input_length = max([len(item["input_ids"]) for item in batch])
             input_ids = []
             attention_mask = []
@@ -422,6 +514,37 @@ class BCTrainer(BaseTrainer):
                 "attention_mask": torch.LongTensor(attention_mask),
                 "labels": torch.LongTensor(labels),
             }
+
+            # 多模态：如果样本中已经通过 processor 预处理出了 pixel_values / image_grid_thw，
+            # 且当前确认为 VL 模型，则在这里拼接成 batch 传给模型。
+            use_vl = bool(is_vision_language and processor is not None)
+            if use_vl and "pixel_values" in batch[0]:
+                try:
+                    pixel_tensors = []
+                    grid_tensors = []
+                    for item in batch:
+                        pv = item.get("pixel_values", None)
+                        grid = item.get("image_grid_thw", None)
+                        if pv is None or grid is None:
+                            continue
+                        # 单个样本：
+                        # - pv: [num_patches_i, dim]
+                        # - grid: [[T_i, H_i, W_i]]
+                        pixel_tensors.append(torch.tensor(pv, dtype=torch.float32))
+                        grid_tensors.append(torch.tensor(grid, dtype=torch.long))
+                    if pixel_tensors:
+                        # 拼成：
+                        # - pixel_values: [sum_i num_patches_i, dim]
+                        # - image_grid_thw: [num_images_in_batch, 3]
+                        forward_kwargs["pixel_values"] = torch.cat(
+                            pixel_tensors, dim=0
+                        )
+                        forward_kwargs["image_grid_thw"] = torch.cat(
+                            grid_tensors, dim=0
+                        )
+                except Exception:
+                    # 不因为图像失败而中断训练
+                    pass
             return {"forward_kwargs": forward_kwargs}
 
         self.train_dataset = tokenized_dataset["train"]
@@ -431,7 +554,12 @@ class BCTrainer(BaseTrainer):
             batch_size=self.args["batch_size"],
             num_workers=self.args["num_workers"],
             pin_memory=True,
-            collate_fn=partial(collate_fn, tokenizer=self.agent.tokenizer),
+            collate_fn=partial(
+                collate_fn,
+                tokenizer=self.agent.tokenizer,
+                processor=self.processor,
+                is_vision_language=self.is_vision_language,
+            ),
         )
         self.accelerator.print("Number of train batches:", len(self.train_dataloader))
 
@@ -927,4 +1055,394 @@ class BCTrainer(BaseTrainer):
             do_sample=True,
             temperature=1.2,
             record_to_file=True,
+        )
+
+
+class QwenVLBCTrainer(BCTrainer):
+    """
+    专门针对 Qwen-VL / Qwen2-VL 系列的多模态行为克隆 Trainer。
+    与通用 BCTrainer 的主要区别：
+      - 不再手工用 tokenizer.encode 拼文本；
+      - 在 collate_fn 里直接使用 AutoProcessor.apply_chat_template，一次性生成
+        input_ids / attention_mask / pixel_values / image_grid_thw，避免
+        “Image features and image tokens do not match” 一类错配。
+    训练循环、优化器等逻辑沿用父类。
+    """
+
+    def get_train_dataloader(self):
+        """
+        为 Qwen-VL 构建 train_dataloader：
+        - 保留原始 self.raw_dataset['train']；
+        - 在 collate_fn 里把一整个 batch 转成 Qwen-VL 所需的对话格式，
+          交给 AutoProcessor 统一做多模态处理。
+        """
+
+        assert (
+            self.processor is not None and self.is_vision_language
+        ), "QwenVLBCTrainer 仅在多模态模型（processor + is_vision_language=True）下使用"
+
+        processor = self.processor
+        args = self.args
+        # 官方推荐由 tokenizer 提供 chat_template；AutoProcessor 通常把 tokenizer 挂在其 tokenizer 属性下
+        tok_for_template = getattr(processor, "tokenizer", processor)
+
+        # 若开启 assistant_only_loss，则改用专门的 collate_fn，只监督 assistant tokens。
+        if bool(args.get("assistant_only_loss", False)):
+            max_input_length = int(args.get("max_input_length", 4096))
+            self.train_dataset = self.raw_dataset["train"]
+            self.train_dataloader = DataLoader(
+                self.train_dataset,
+                shuffle=True,
+                batch_size=self.args["batch_size"],
+                num_workers=self.args["num_workers"],
+                pin_memory=True,
+                collate_fn=lambda batch: collate_qwen_vl_assistant_only(
+                    batch=batch,
+                    tokenizer=self.agent.tokenizer,
+                    processor=self.processor,
+                    max_input_length=max_input_length,
+                ),
+            )
+            self.accelerator.print(
+                "Number of train batches (Qwen-VL, assistant-only loss):",
+                len(self.train_dataloader),
+            )
+            return
+
+        # 调试模式下，为了避免显存 OOM，可以对每个样本施加更严格的 token 上限。
+        # 这里从 args 中读取开关和上限；正常训练不受影响。
+        debug_mode = bool(args.get("debug", False))
+        # 若未显式设置 debug_max_tokens，则回退到 max_input_length，进一步回退到 512。
+        try:
+            debug_max_tokens = int(
+                args.get(
+                    "debug_max_tokens",
+                    args.get("max_input_length", 512),
+                )
+            )
+        except Exception:
+            debug_max_tokens = 512
+
+        # 预先解析“图像 token id”，用于在 collate_fn 里判断当前 batch 文本中
+        # 是否真的包含图像 token；若没有，则不要把 pixel_values 传给模型，
+        # 否则会触发 “Image features and image tokens do not match” 报错。
+        image_token_ids = set()
+        try:
+            model_config = getattr(self.agent.model, "config", None)
+            if model_config is not None and hasattr(model_config, "image_token_index"):
+                idx = getattr(model_config, "image_token_index")
+                if isinstance(idx, int):
+                    image_token_ids.add(int(idx))
+                elif isinstance(idx, (list, tuple)):
+                    for v in idx:
+                        try:
+                            image_token_ids.add(int(v))
+                        except Exception:
+                            continue
+        except Exception:
+            image_token_ids = set()
+
+        # 若 config 中没有给出，则从 tokenizer 词表里启发式查找包含 "image" 关键字的 token
+        if not image_token_ids:
+            try:
+                tok = getattr(processor, "tokenizer", None)
+                vocab = None
+                if tok is not None:
+                    if hasattr(tok, "get_vocab"):
+                        vocab = tok.get_vocab()
+                    elif hasattr(tok, "vocab"):
+                        vocab = tok.vocab
+                if isinstance(vocab, dict):
+                    for k, v in vocab.items():
+                        try:
+                            if "image" in str(k).lower():
+                                image_token_ids.add(int(v))
+                        except Exception:
+                            continue
+            except Exception:
+                image_token_ids = set()
+
+        def build_qwen_vl_conversation(item):
+            """
+            将单条样本的 conversations 转成 Qwen-VL chat template 期望的格式：
+            [
+              {
+                "role": "user" | "assistant",
+                "content": [
+                  {"type": "image", "image": PIL.Image},
+                  {"type": "text", "text": "..."},
+                  ...
+                ]
+              },
+              ...
+            ]
+            """
+            conversations = item["conversations"]
+            proc_messages = []
+            images_for_conv = []
+
+            for message in conversations:
+                raw_val = message["value"]
+                text_val = raw_val
+                screenshot_b64 = None
+
+                # 兼容嵌套 JSON：{"instruction": ..., "step_text": ..., "screenshot_base64": ...}
+                if isinstance(raw_val, str) and raw_val.strip().startswith("{"):
+                    try:
+                        inner = json.loads(raw_val)
+                        if isinstance(inner, dict):
+                            instr = inner.get("instruction") or ""
+                            step_text = inner.get("step_text") or ""
+                            merged_txt = (
+                                str(instr).strip() + "\n" + str(step_text).strip()
+                            ).strip()
+                            if merged_txt:
+                                text_val = merged_txt
+                            screenshot_b64 = inner.get("screenshot_base64")
+                    except Exception:
+                        pass
+
+                content_parts = []
+
+                # 如果存在截图，则解码为 PIL.Image 并作为 image 内容传入
+                img = None
+                if screenshot_b64 and Image is not None:
+                    try:
+                        b64_str = str(screenshot_b64)
+                        if "," in b64_str and b64_str.strip().startswith("data:"):
+                            b64_str = b64_str.split(",", 1)[-1]
+                        img_bytes = base64.b64decode(b64_str)
+                        img = Image.open(BytesIO(img_bytes)).convert("RGB")
+                        content_parts.append({"type": "image", "image": img})
+                    except Exception:
+                        # 图像解码失败时，退化为纯文本
+                        img = None
+                if img is not None:
+                    images_for_conv.append(img)
+
+                if text_val:
+                    content_parts.append({"type": "text", "text": str(text_val)})
+
+                if not content_parts:
+                    # 至少保证有一个空文本，避免 processor 崩溃
+                    content_parts.append({"type": "text", "text": ""})
+
+                role = "user" if message["from"] == "human" else "assistant"
+                proc_messages.append({"role": role, "content": content_parts})
+
+            return proc_messages, images_for_conv
+
+        def collate_fn(batch):
+            """
+            对于 Qwen-VL：
+            - 先对每个样本单独调用 apply_chat_template(..., tokenize=False) 得到纯文本 prompt；
+            - 再统一用 processor(text=..., images=...) 编码成批次，自动对齐图像 token 与特征。
+            """
+            texts = []
+            images_batch = []
+
+            for item in batch:
+                messages, images_for_conv = build_qwen_vl_conversation(item)
+
+                # 对于当前 Qwen2-VL 的 chat_template：
+                #   "{% if messages is string %}{{ messages }}{% else %}{% for content in messages %}..."
+                # 期望传入的是「content 列表」（每个元素是 {"type": "image"/"text", ...}），
+                # 而不是带 role 的多轮对话结构。因此这里先把所有 turn 的 content 扁平化。
+                flat_contents = []
+                try:
+                    for msg in messages:
+                        parts = msg.get("content", [])
+                        if isinstance(parts, (list, tuple)):
+                            flat_contents.extend(parts)
+                except Exception:
+                    flat_contents = []
+
+                # 调试模式：基于 chat_template + tokenizer 估算 token 数，贪心截断 flat_contents，
+                # 同时按顺序截断 images_for_conv，保证图文对齐。
+                if debug_mode and flat_contents:
+                    trimmed_contents: list[dict] = []
+                    used_image_count = 0
+
+                    for part in flat_contents:
+                        candidate = trimmed_contents + [part]
+                        token_len = None
+                        try:
+                            tokenized = tok_for_template.apply_chat_template(
+                                candidate,
+                                add_generation_prompt=False,
+                                tokenize=True,
+                            )
+                            # tokenized 可能是 list[int] / list[list[int]] / BatchEncoding(dict)
+                            if isinstance(tokenized, dict):
+                                ids = tokenized.get("input_ids", None)
+                                if isinstance(ids, (list, tuple)):
+                                    if ids and isinstance(ids[0], (list, tuple)):
+                                        token_len = len(ids[0])
+                                    else:
+                                        token_len = len(ids)
+                            elif isinstance(tokenized, (list, tuple)):
+                                # list[int] 或 list[list[int]]
+                                if tokenized and isinstance(tokenized[0], (list, tuple)):
+                                    token_len = len(tokenized[0])
+                                else:
+                                    token_len = len(tokenized)
+                        except Exception:
+                            # 若估算失败，则认为本次加入会超出上限，直接停止扩展
+                            token_len = debug_max_tokens + 1
+
+                        if token_len is None:
+                            # 保守处理，当成超出上限
+                            break
+                        if token_len > debug_max_tokens:
+                            # 再加入当前 part 会超过预算，停止扩展
+                            break
+
+                        trimmed_contents.append(part)
+                        if (
+                            isinstance(part, dict)
+                            and part.get("type") == "image"
+                        ):
+                            used_image_count += 1
+
+                    if not trimmed_contents:
+                        # 至少保证一个空文本，避免后续 processor 崩溃
+                        trimmed_contents = [{"type": "text", "text": ""}]
+                        used_image_count = 0
+
+                    flat_contents = trimmed_contents
+                    if images_for_conv:
+                        images_for_conv = images_for_conv[:used_image_count]
+
+                # 使用 tokenizer 的 chat_template 将扁平化的 content 列表转成纯文本 prompt，
+                # 再配合 images 一起送入 AutoProcessor。
+                try:
+                    text = tok_for_template.apply_chat_template(
+                        flat_contents,
+                        add_generation_prompt=False,  # 训练阶段不额外追加生成提示
+                        tokenize=False,
+                    )
+                except Exception:
+                    text = None
+
+                # 若模板返回空串 / 非字符串，则做一个最小兜底，避免 input_ids 为空序列。
+                if not isinstance(text, str) or not text.strip():
+                    # 简单拼接所有文本片段作为 fallback
+                    fallback_text_parts = []
+                    for part in flat_contents:
+                        if (
+                            isinstance(part, dict)
+                            and part.get("type") == "text"
+                        ):
+                            t = str(part.get("text", "")).strip()
+                            if t:
+                                fallback_text_parts.append(t)
+                    fallback_text = "\n".join(fallback_text_parts).strip()
+                    text = fallback_text if fallback_text else " "
+
+                texts.append(text)
+                images_batch.append(images_for_conv if images_for_conv else [])
+
+            # 至少有一个样本带图像时，传入 images 参数；否则仅按纯文本处理
+            if any(len(imgs) > 0 for imgs in images_batch):
+                model_inputs = processor(
+                    text=texts,
+                    images=images_batch,
+                    return_tensors="pt",
+                    truncation=False,
+                    max_length=args.get("max_input_length", 4096),
+                    padding=True,
+                )
+            else:
+                model_inputs = processor(
+                    text=texts,
+                    return_tensors="pt",
+                    truncation=False,
+                    max_length=args.get("max_input_length", 4096),
+                    padding=True,
+                )
+
+            input_ids = model_inputs["input_ids"]
+            attention_mask = model_inputs["attention_mask"]
+
+            # 防御性处理：如果某些 batch 里所有样本的 prompt 都被截断成空序列，
+            # 会出现 shape = [B, 0]，导致模型内部在 dim=1 上做 max/reduction 时触发
+            # “Expected reduction dim 1 to have non-zero size” 的报错。
+            # 这里强制为每个样本至少保留 1 个占位 token。
+            try:
+                if input_ids.size(1) == 0:
+                    # 尝试从 processor.tokenizer 或 agent.tokenizer 获取一个合理的占位 token
+                    tok = getattr(processor, "tokenizer", None)
+                    if tok is None and hasattr(self, "agent"):
+                        tok = getattr(self.agent, "tokenizer", None)
+                    fallback_id = None
+                    if tok is not None:
+                        for attr in ["eos_token_id", "pad_token_id", "bos_token_id", "unk_token_id"]:
+                            vid = getattr(tok, attr, None)
+                            if isinstance(vid, int) and vid >= 0:
+                                fallback_id = vid
+                                break
+                    if fallback_id is None:
+                        fallback_id = 0
+                    bsz = input_ids.size(0)
+                    device = input_ids.device
+                    input_ids = torch.full(
+                        (bsz, 1),
+                        int(fallback_id),
+                        dtype=torch.long,
+                        device=device,
+                    )
+                    attention_mask = torch.ones(
+                        (bsz, 1),
+                        dtype=torch.long,
+                        device=device,
+                    )
+            except Exception:
+                # 如果检查失败，则保持原始输出，让上游错误暴露
+                pass
+
+            # Qwen2-VL 系列通常会返回 pixel_values / image_grid_thw
+            pixel_values = model_inputs.get("pixel_values", None)
+            image_grid_thw = model_inputs.get("image_grid_thw", None)
+
+            # 这里简单地对所有 token 做 LM 训练；如果后续需要只监督 assistant 段，可以再细化 labels 构造逻辑
+            labels = input_ids.clone()
+
+            forward_kwargs = {
+                "input_ids": input_ids.to(dtype=torch.long),
+                "attention_mask": attention_mask.to(dtype=torch.long),
+                "labels": labels.to(dtype=torch.long),
+            }
+
+            # 仅当文本中真实存在图像 token 时，才把图像特征传给模型；
+            # 否则会出现 “tokens: 0, features > 0” 的错配。
+            attach_images = (
+                pixel_values is not None
+                and image_grid_thw is not None
+            )
+            if attach_images and image_token_ids:
+                try:
+                    flat_ids = input_ids.view(-1).tolist()
+                    attach_images = any(tid in image_token_ids for tid in flat_ids)
+                except Exception:
+                    # 回退为保守策略：若检查失败，则仍然尝试传入图像
+                    attach_images = True
+
+            if attach_images:
+                forward_kwargs["pixel_values"] = pixel_values
+                forward_kwargs["image_grid_thw"] = image_grid_thw
+
+            return {"forward_kwargs": forward_kwargs}
+
+        # 对于 QwenVLBCTrainer，我们直接使用原始 train 集合，让 collate_fn 处理多模态
+        self.train_dataset = self.raw_dataset["train"]
+        self.train_dataloader = DataLoader(
+            self.train_dataset,
+            shuffle=True,
+            batch_size=self.args["batch_size"],
+            num_workers=self.args["num_workers"],
+            pin_memory=True,
+            collate_fn=collate_fn,
+        )
+        self.accelerator.print(
+            "Number of train batches (Qwen-VL):", len(self.train_dataloader)
         )

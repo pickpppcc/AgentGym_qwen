@@ -15,7 +15,7 @@ from agentenv.envs import (
     WebshopTask,
     OSWorldTask,
 )
-from agentenv.trainer.bc_trainer import BCTrainer
+from agentenv.trainer.bc_trainer import BCTrainer, QwenVLBCTrainer
 from transformers import AutoModelForCausalLM, AutoTokenizer, AutoProcessor
 
 # 兼容新旧 Transformers：新版本优先使用 AutoModelForImageTextToText；否则回退到 AutoModelForVision2Seq
@@ -117,6 +117,28 @@ class TrainingArguments:
     # 开发/调试：限制训练样本数做冒烟测试
     train_max_samples: Optional[int] = field(
         default=None, metadata={"help": "Limit number of training samples for quick smoke test"}
+    )
+
+    # 仅监督 assistant 回复（mask 掉 user 段）的选项，仅对 Qwen-VL 专用 Trainer 生效
+    assistant_only_loss: bool = field(
+        default=False,
+        metadata={
+            "help": "If True, only supervise assistant tokens (mask user tokens with -100) in Qwen-VL trainer."
+        },
+    )
+
+    # 调试参数：在多模态 collate_fn 中控制单样本 token 数，避免 OOM
+    debug: bool = field(
+        default=False,
+        metadata={
+            "help": "Enable debug mode: use stricter per-sample token budget in VL collate_fn to avoid OOM."
+        },
+    )
+    debug_max_tokens: int = field(
+        default=512,
+        metadata={
+            "help": "Max input token length per sample in debug mode for vision-language collate_fn."
+        },
     )
 
 
@@ -288,13 +310,20 @@ def main():
         if isinstance(args.step_pause_seconds, (int, float)):
             env_args["step_pause_seconds"] = args.step_pause_seconds
 
-    trainer = BCTrainer(
+    # 视觉语言模型用 QwenVLBCTrainer，多模态处理完全交给 AutoProcessor；
+    # 纯文本模型则使用通用 BCTrainer。
+    TrainerCls = QwenVLBCTrainer if is_vision_language else BCTrainer
+
+    trainer = TrainerCls(
         Agent(model, tokenizer),
         [task_class(client_args=env_args, n_clients=1)],
         args,
+        processor=processor if is_vision_language else None,
+        is_vision_language=is_vision_language,
     )
 
-    trainer.train()
+    # trainer.train()
+    trainer.train_and_inference()
 
 
 if __name__ == "__main__":
