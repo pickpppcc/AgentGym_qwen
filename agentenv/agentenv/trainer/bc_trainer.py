@@ -1122,6 +1122,86 @@ class QwenVLBCTrainer(BCTrainer):
             except Exception:
                 image_token_ids = set()
 
+        def build_mask_for_single_sequence(
+            input_id_row: torch.Tensor,
+            assistant_prefix_ids,
+            im_end_ids,
+            ignore_index: int = -100,
+        ):
+            """
+            针对单条样本：
+            - 在 token 序列中查找所有 "<|im_start|>assistant\\n" 片段的位置；
+            - 对于每个位置，向后找到下一个 "<|im_end|>" 片段；
+            - 把这两个之间的 token 设为有效 label，其余设为 ignore_index。
+            """
+            target = torch.full_like(input_id_row, ignore_index)
+            ids = input_id_row.tolist()
+            n = len(ids)
+
+            pre = assistant_prefix_ids
+            pre_len = len(pre)
+
+            end = im_end_ids
+            end_len = len(end)
+
+            def find_subseq(haystack, needle, start_pos):
+                """在 list[int] 里从 start_pos 开始寻找 needle 子序列，返回起始下标或 None"""
+                last = len(haystack) - len(needle)
+                for s in range(start_pos, last + 1):
+                    if haystack[s : s + len(needle)] == needle:
+                        return s
+                return None
+
+            pos = 0
+            while pos <= n - pre_len:
+                # 找到一个 "<|im_start|>assistant\\n" 前缀
+                if ids[pos : pos + pre_len] == pre:
+                    content_start = pos + pre_len
+
+                    # 从 content_start 往后找最近的 "<|im_end|>"
+                    end_pos = find_subseq(ids, end, content_start)
+                    if end_pos is None:
+                        # 理论上不应该发生；保守处理：直接 break
+                        break
+
+                    # [content_start, end_pos) 之间的 token 是 assistant 的内容
+                    if content_start < end_pos:
+                        target[content_start:end_pos] = input_id_row[content_start:end_pos]
+
+                    # 继续往后找下一个 assistant 段
+                    pos = end_pos + end_len
+                else:
+                    pos += 1
+
+            return target
+
+        def make_labels(input_ids: torch.Tensor, tokenizer, ignore_index: int = -100):
+            """
+            根据 input_ids 生成 labels，Mask 掉 user/system 部分，只保留 assistant 段落：
+            即形如 <|im_start|>assistant\\n ... <|im_end|> 中间的 token。
+            适用于当前 Qwen2-VL ChatML 模板。
+            """
+            # 关键 token / 片段的 id 序列：
+            # 注意：这里直接构造一个“assistant 段前缀”的 token 序列：
+            # 文本就是模板里的片段："<|im_start|>assistant\n"
+            assistant_prefix_ids = tokenizer.encode(
+                "<|im_start|>assistant\n", add_special_tokens=False
+            )
+            im_end_ids = tokenizer.encode("<|im_end|>", add_special_tokens=False)
+
+            batch_size, _ = input_ids.shape
+            labels = torch.full_like(input_ids, ignore_index)
+
+            for i in range(batch_size):
+                labels[i] = build_mask_for_single_sequence(
+                    input_ids[i],
+                    assistant_prefix_ids=assistant_prefix_ids,
+                    im_end_ids=im_end_ids,
+                    ignore_index=ignore_index,
+                )
+
+            return labels
+
         def build_qwen_vl_conversation(item):
             """
             将单条样本的 conversations 转成 Qwen-VL chat template 期望的格式：
@@ -1298,8 +1378,20 @@ class QwenVLBCTrainer(BCTrainer):
             pixel_values = model_inputs.get("pixel_values", None)
             image_grid_thw = model_inputs.get("image_grid_thw", None)
 
-            # label 构造：目前简化为对所有 token 做 LM 训练（后续若需要 assistant-only，可在此基础上再细化）
-            labels = input_ids.clone()
+            # label 构造：
+            #  - 默认：对所有 token 做 LM 训练（labels = input_ids）
+            #  - 若启用 assistant_only_loss：仅对 assistant 轮次的 token 计算 loss，其余位置置为 -100
+            assistant_only = bool(args.get("assistant_only_loss", False))
+            if not assistant_only:
+                labels = input_ids.clone()
+            else:
+                # 基于 ChatML token 序列，只对 assistant 段落计算 loss
+                tok_for_labels = getattr(processor, "tokenizer", processor)
+                labels = make_labels(
+                    input_ids=input_ids,
+                    tokenizer=tok_for_labels,
+                    ignore_index=-100,
+                )
 
             forward_kwargs = {
                 "input_ids": input_ids.to(dtype=torch.long),
