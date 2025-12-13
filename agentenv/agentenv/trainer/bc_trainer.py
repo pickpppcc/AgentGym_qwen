@@ -22,9 +22,6 @@ from agentenv.controller.agent import Agent
 from agentenv.controller.task import BaseTask
 from agentenv.controller.utils import BaseTrainer
 from agentenv.trainer.utils import set_seed
-from agentenv.trainer.collate_qwen_vl_assistant_only import (
-    collate_qwen_vl_assistant_only,
-)
 from datasets import Dataset, DatasetDict
 from torch.utils.data import DataLoader
 from tqdm import tqdm
@@ -1086,43 +1083,6 @@ class QwenVLBCTrainer(BCTrainer):
         # 官方推荐由 tokenizer 提供 chat_template；AutoProcessor 通常把 tokenizer 挂在其 tokenizer 属性下
         tok_for_template = getattr(processor, "tokenizer", processor)
 
-        # 若开启 assistant_only_loss，则改用专门的 collate_fn，只监督 assistant tokens。
-        if bool(args.get("assistant_only_loss", False)):
-            max_input_length = int(args.get("max_input_length", 4096))
-            self.train_dataset = self.raw_dataset["train"]
-            self.train_dataloader = DataLoader(
-                self.train_dataset,
-                shuffle=True,
-                batch_size=self.args["batch_size"],
-                num_workers=self.args["num_workers"],
-                pin_memory=True,
-                collate_fn=lambda batch: collate_qwen_vl_assistant_only(
-                    batch=batch,
-                    tokenizer=self.agent.tokenizer,
-                    processor=self.processor,
-                    max_input_length=max_input_length,
-                ),
-            )
-            self.accelerator.print(
-                "Number of train batches (Qwen-VL, assistant-only loss):",
-                len(self.train_dataloader),
-            )
-            return
-
-        # 调试模式下，为了避免显存 OOM，可以对每个样本施加更严格的 token 上限。
-        # 这里从 args 中读取开关和上限；正常训练不受影响。
-        debug_mode = bool(args.get("debug", False))
-        # 若未显式设置 debug_max_tokens，则回退到 max_input_length，进一步回退到 512。
-        try:
-            debug_max_tokens = int(
-                args.get(
-                    "debug_max_tokens",
-                    args.get("max_input_length", 512),
-                )
-            )
-        except Exception:
-            debug_max_tokens = 512
-
         # 预先解析“图像 token id”，用于在 collate_fn 里判断当前 batch 文本中
         # 是否真的包含图像 token；若没有，则不要把 pixel_values 传给模型，
         # 否则会触发 “Image features and image tokens do not match” 报错。
@@ -1235,8 +1195,9 @@ class QwenVLBCTrainer(BCTrainer):
         def collate_fn(batch):
             """
             对于 Qwen-VL：
-            - 先对每个样本单独调用 apply_chat_template(..., tokenize=False) 得到纯文本 prompt；
-            - 再统一用 processor(text=..., images=...) 编码成批次，自动对齐图像 token 与特征。
+            - 直接以多轮 messages（包含 role 和 content 列表）作为单位，
+              调用 tokenizer.apply_chat_template(..., tokenize=False) 得到纯文本 prompt；
+            - 再统一用 AutoProcessor(text=..., images=...) 编码成批次，自动对齐图像 token 与特征。
             """
             texts = []
             images_batch = []
@@ -1244,100 +1205,33 @@ class QwenVLBCTrainer(BCTrainer):
             for item in batch:
                 messages, images_for_conv = build_qwen_vl_conversation(item)
 
-                # 对于当前 Qwen2-VL 的 chat_template：
-                #   "{% if messages is string %}{{ messages }}{% else %}{% for content in messages %}..."
-                # 期望传入的是「content 列表」（每个元素是 {"type": "image"/"text", ...}），
-                # 而不是带 role 的多轮对话结构。因此这里先把所有 turn 的 content 扁平化。
-                flat_contents = []
-                try:
-                    for msg in messages:
-                        parts = msg.get("content", [])
-                        if isinstance(parts, (list, tuple)):
-                            flat_contents.extend(parts)
-                except Exception:
-                    flat_contents = []
-
-                # 调试模式：基于 chat_template + tokenizer 估算 token 数，贪心截断 flat_contents，
-                # 同时按顺序截断 images_for_conv，保证图文对齐。
-                if debug_mode and flat_contents:
-                    trimmed_contents: list[dict] = []
-                    used_image_count = 0
-
-                    for part in flat_contents:
-                        candidate = trimmed_contents + [part]
-                        token_len = None
-                        try:
-                            tokenized = tok_for_template.apply_chat_template(
-                                candidate,
-                                add_generation_prompt=False,
-                                tokenize=True,
-                            )
-                            # tokenized 可能是 list[int] / list[list[int]] / BatchEncoding(dict)
-                            if isinstance(tokenized, dict):
-                                ids = tokenized.get("input_ids", None)
-                                if isinstance(ids, (list, tuple)):
-                                    if ids and isinstance(ids[0], (list, tuple)):
-                                        token_len = len(ids[0])
-                                    else:
-                                        token_len = len(ids)
-                            elif isinstance(tokenized, (list, tuple)):
-                                # list[int] 或 list[list[int]]
-                                if tokenized and isinstance(tokenized[0], (list, tuple)):
-                                    token_len = len(tokenized[0])
-                                else:
-                                    token_len = len(tokenized)
-                        except Exception:
-                            # 若估算失败，则认为本次加入会超出上限，直接停止扩展
-                            token_len = debug_max_tokens + 1
-
-                        if token_len is None:
-                            # 保守处理，当成超出上限
-                            break
-                        if token_len > debug_max_tokens:
-                            # 再加入当前 part 会超过预算，停止扩展
-                            break
-
-                        trimmed_contents.append(part)
-                        if (
-                            isinstance(part, dict)
-                            and part.get("type") == "image"
-                        ):
-                            used_image_count += 1
-
-                    if not trimmed_contents:
-                        # 至少保证一个空文本，避免后续 processor 崩溃
-                        trimmed_contents = [{"type": "text", "text": ""}]
-                        used_image_count = 0
-
-                    flat_contents = trimmed_contents
-                    if images_for_conv:
-                        images_for_conv = images_for_conv[:used_image_count]
-
-                # 使用 tokenizer 的 chat_template 将扁平化的 content 列表转成纯文本 prompt，
-                # 再配合 images 一起送入 AutoProcessor。
+                # 使用自定义的 chat_template，将多轮 role+content 结构转成带 <|vision_start|><|image_pad|><|vision_end|> 的文本。
                 try:
                     text = tok_for_template.apply_chat_template(
-                        flat_contents,
-                        add_generation_prompt=False,  # 训练阶段不额外追加生成提示
+                        messages,
+                        add_generation_prompt=False,
                         tokenize=False,
                     )
                 except Exception:
                     text = None
 
-                # 若模板返回空串 / 非字符串，则做一个最小兜底，避免 input_ids 为空序列。
+                # 若模板返回空串 / 非字符串，则简单拼接所有文本片段作为回退，避免出现空序列。
                 if not isinstance(text, str) or not text.strip():
-                    # 简单拼接所有文本片段作为 fallback
                     fallback_text_parts = []
-                    for part in flat_contents:
-                        if (
-                            isinstance(part, dict)
-                            and part.get("type") == "text"
-                        ):
-                            t = str(part.get("text", "")).strip()
-                            if t:
-                                fallback_text_parts.append(t)
-                    fallback_text = "\n".join(fallback_text_parts).strip()
-                    text = fallback_text if fallback_text else " "
+                    try:
+                        for msg in messages:
+                            for part in msg.get("content", []):
+                                if (
+                                    isinstance(part, dict)
+                                    and part.get("type") == "text"
+                                ):
+                                    t = str(part.get("text", "")).strip()
+                                    if t:
+                                        fallback_text_parts.append(t)
+                    except Exception:
+                        fallback_text_parts = []
+                        fallback_text = "\n".join(fallback_text_parts).strip()
+                        text = fallback_text if fallback_text else " "
 
                 texts.append(text)
                 images_batch.append(images_for_conv if images_for_conv else [])
@@ -1404,7 +1298,7 @@ class QwenVLBCTrainer(BCTrainer):
             pixel_values = model_inputs.get("pixel_values", None)
             image_grid_thw = model_inputs.get("image_grid_thw", None)
 
-            # 这里简单地对所有 token 做 LM 训练；如果后续需要只监督 assistant 段，可以再细化 labels 构造逻辑
+            # label 构造：目前简化为对所有 token 做 LM 训练（后续若需要 assistant-only，可在此基础上再细化）
             labels = input_ids.clone()
 
             forward_kwargs = {
