@@ -14,7 +14,7 @@ from transformers.generation.utils import GenerateOutput
 from .types import ConversationMessage, APIConversationMessage, InferenceEngine, TokenizedConversationOutput
 
 import time
-from typing import Tuple
+from typing import Tuple, Any, Optional
 from openai import OpenAI
 
 try:
@@ -66,12 +66,17 @@ class Agent:
         tokenizer: PreTrainedTokenizerBase,
         chat_template: BaseChatTemplate | None = None,
         inference_engine: InferenceEngine = "default",
+        processor: Optional[Any] = None,
+        is_vision_language: bool = False,
     ) -> None:
         self.model = model
         self.tokenizer = tokenizer
         self.chat_template = chat_template or Llama2Template()
         self.inference_engine = InferenceEngine(inference_engine)
         self._vllm = None
+        # 可选：为多模态模型挂载 AutoProcessor 及标记
+        self.processor = processor
+        self.is_vision_language = is_vision_language
 
     @torch.no_grad()
     def generate(

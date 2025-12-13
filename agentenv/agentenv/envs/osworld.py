@@ -116,10 +116,38 @@ class OSWorldEnvClient(BaseEnvClient):
         if self.observe_format == "text":
             return self._format_observation(ob)
         elif self.observe_format == "screenshot_base64":
+            """
+            为视觉语言模型返回「文本 + 截图」的组合：
+            - instruction: 任务指令文本
+            - step_text:   当前环境状态的简短说明（这里先留空，可后续扩展）
+            - screenshot_base64: 当前帧截图（data:image/png;base64,...）
+
+            统一打包成 JSON 字符串，方便下游像离线数据一样解析：
+            {"instruction": ..., "step_text": ..., "screenshot_base64": ...}
+            """
             try:
-                return ob.get("screenshot_base64", "")  # type: ignore[union-attr]
+                instr: str | None = None
+                step_text: str = ""
+                screenshot_b64: str = ""
+                if isinstance(ob, dict):
+                    raw_instr = ob.get("instruction")
+                    if isinstance(raw_instr, str) and raw_instr.strip():
+                        instr = raw_instr.strip()
+                    raw_ss = ob.get("screenshot_base64", "")
+                    if isinstance(raw_ss, str):
+                        screenshot_b64 = raw_ss
+                payload = {
+                    "instruction": instr or "",
+                    "step_text": step_text,
+                    "screenshot_base64": screenshot_b64,
+                }
+                return json.dumps(payload, ensure_ascii=False)
             except Exception:
-                return ""
+                # 兜底：退化为仅返回截图，保持旧行为尽量不崩
+                try:
+                    return ob.get("screenshot_base64", "")  # type: ignore[union-attr]
+                except Exception:
+                    return ""
         elif self.observe_format == "raw":
             return str(ob)
         else:

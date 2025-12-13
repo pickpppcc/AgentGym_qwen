@@ -6,7 +6,7 @@ import os
 
 import torch
 import transformers
-from agentenv.controller import Agent
+from agentenv.controller import Agent, ChatMLTemplate
 from agentenv.envs import (
     AlfWorldTask,
     SciworldTask,
@@ -314,8 +314,22 @@ def main():
     # 纯文本模型则使用通用 BCTrainer。
     TrainerCls = QwenVLBCTrainer if is_vision_language else BCTrainer
 
+    # 对于 Qwen / Qwen-VL 等 ChatML 风格模型，在线环境交互时也使用 ChatML 模板，
+    # 以保持与离线预训练/微调时的对话格式一致；其他模型走默认模板。
+    chat_template = ChatMLTemplate() if is_vision_language else None
+
+    # 将 AutoProcessor 与多模态标记挂到 Agent 上，便于在线环境交互时走真正多模态链路。
+    agent = Agent(
+        model,
+        tokenizer,
+        chat_template=chat_template,
+        inference_engine="default",
+        processor=processor if is_vision_language else None,
+        is_vision_language=is_vision_language,
+    )
+
     trainer = TrainerCls(
-        Agent(model, tokenizer),
+        agent,
         [task_class(client_args=env_args, n_clients=1)],
         args,
         processor=processor if is_vision_language else None,

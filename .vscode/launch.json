@@ -26,9 +26,9 @@
           "CUDA_DEVICE_MAX_CONNECTIONS": "1"
         },
         "args": [
-          "--train_file", "/data/pengchen/OSWorld/Osworld/AgentGym2/AgentGym/data/test_smoke.json",
-          "--inference_file", "/data/pengchen/OSWorld/Osworld/AgentGym2/AgentGym/data/test_smoke.json",
-          "--test_file", "/data/pengchen/OSWorld/Osworld/AgentGym2/AgentGym/data/test_smoke.json",
+          "--train_file", "/data/pengchen/OSWorld/Osworld/AgentGym2/AgentGym/data/test_real_smoke_4turn.json",
+          "--inference_file", "/data/pengchen/OSWorld/Osworld/AgentGym2/AgentGym/data/test_real_smoke_4turn.json",
+          "--test_file", "/data/pengchen/OSWorld/Osworld/AgentGym2/AgentGym/data/test_real_smoke_4turn.json",
           "--model_train_path", "/data/pengchen/OSWorld/Osworld/models/Qwen2-VL-2B",
           "--model_save_path", "/data/pengchen/OSWorld/Osworld/AgentGym2/AgentGym/agentenv/outputs/behavioral_clone_osworld_smoke",
           "--task_name", "osworld",
