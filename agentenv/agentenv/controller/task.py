@@ -1,5 +1,6 @@
 from typing import Any, Callable, Mapping, Optional, Sequence
 import json
+import re
 from io import BytesIO
 import base64
 
@@ -49,6 +50,142 @@ class BaseTask:
         done = False
         state = client.observe()
 
+        def _uitars_system_prompt() -> str:
+            return (
+                "You are UITARS, a GUI agent that controls a real desktop environment.\n\n"
+                "Your response is parsed by a strict program. Any extra text or formatting may break execution.\n\n"
+                "OUTPUT (exactly 2 lines; no Markdown; no code fences):\n"
+                "Thought: <1–2 sentences; follow the language requested in the user prompt; include a tiny plan; end with 'Next: ...'>\n"
+                "Action: <exactly ONE action call>\n\n"
+                "RULES:\n"
+                "- Include exactly one 'Thought:' line and exactly one 'Action:' line.\n"
+                "- The Action line must be a single function call from the provided action space.\n"
+                "- Never output multiple actions, numbered steps, bullet lists, or explanations.\n"
+                "- Coordinates are pixel coordinates on a 1920x1080 desktop (x in [0,1920], y in [0,1080]); use numbers like (960,540).\n"
+                "- For click/left_double/right_single/drag/scroll: use start_box/end_box as plain '(x,y)' numeric pairs; "
+                "do NOT include '<|box_start|>' tokens.\n"
+                "- For type(content=...): use a single-quoted string; use \\\\n to press Enter; escape quotes if needed.\n"
+                "- If waiting for the UI, output Action: wait(). If finished, output Action: finished().\n"
+                "- If impossible or you need user help, output Action: call_user()."
+            )
+
+        def _sanitize_obs_text(raw_val: str) -> str:
+            """
+            OSWorld VL 观测可能是包含 screenshot_base64 的 JSON 字符串；这里抽取 instruction/step_text，
+            避免把整段 Base64 token 化造成超长序列。
+            """
+            if not isinstance(raw_val, str):
+                return str(raw_val)
+            s = raw_val.strip()
+            if not s.startswith("{"):
+                return raw_val
+            try:
+                inner = json.loads(s)
+                if not isinstance(inner, dict):
+                    return raw_val
+                instr = inner.get("instruction") or ""
+                step_text = inner.get("step_text") or ""
+                merged_txt = (str(instr).strip() + "\n" + str(step_text).strip()).strip()
+                return merged_txt or raw_val
+            except Exception:
+                return raw_val
+
+        def _split_system_from_conversation_start(
+            conv_start: Sequence[ConversationMessage],
+        ) -> tuple[str | None, list[ConversationMessage]]:
+            """
+            OSWorld sometimes stores the strict system prompt as the first 'human' message
+            for compatibility with text-only templates. Promote it to a real system prompt
+            for API/VL paths and drop it from user content.
+            """
+            if not conv_start:
+                return None, []
+            first = conv_start[0]
+            first_from = str(first.get("from", ""))
+            first_val = str(first.get("value", ""))
+
+            if first_from == "system":
+                return first_val, list(conv_start[1:])
+
+            looks_like_uitars_sys = (
+                first_from == "human"
+                and first_val.strip().startswith("You are UITARS")
+                and "OUTPUT (exactly 2 lines" in first_val
+            )
+            if looks_like_uitars_sys:
+                return first_val, list(conv_start[1:])
+
+            return None, list(conv_start)
+
+        def _coerce_uitars_format(text: str) -> str:
+            """
+            Best-effort: force model output into exactly:
+              Thought: ...
+              Action: ...
+            If Action cannot be recovered, fall back to wait().
+            """
+            if not isinstance(text, str):
+                text = str(text)
+            raw = text.replace("\r\n", "\n").replace("\r", "\n").strip()
+
+            thought = ""
+            action = ""
+
+            m_th = re.search(r"(?is)\bThought:\s*(.*?)(?:\n\s*Action:|\Z)", raw)
+            if m_th:
+                thought = (m_th.group(1) or "").strip()
+
+            m_act = re.search(r"(?is)\bAction:\s*(.*)", raw)
+            if m_act:
+                action = (m_act.group(1) or "").strip()
+
+            allowed_action_call = re.compile(
+                r"(?is)^(?:"
+                r"(?:click|left_double|right_single|drag|hotkey|type|scroll)\s*\([^\n]*\)"
+                r"|wait\s*\(\s*\)"
+                r"|finished\s*\([^\n]*\)"
+                r"|call_user\s*\(\s*\)"
+                r")$"
+            )
+
+            if action:
+                # Prefer the first non-empty line as the single action line.
+                first_line = ""
+                for line in action.split("\n"):
+                    line = line.strip()
+                    if line:
+                        first_line = line
+                        break
+                action = first_line
+
+            if action and not allowed_action_call.match(action):
+                action = ""
+
+            if not action:
+                # Recover the first valid action call found anywhere in the output.
+                m_fn = re.search(
+                    r"(?is)\b(?:"
+                    r"(?:click|left_double|right_single|drag|hotkey|type|scroll)\s*\([^\n]*\)"
+                    r"|wait\s*\(\s*\)"
+                    r"|finished\s*\([^\n]*\)"
+                    r"|call_user\s*\(\s*\)"
+                    r")\b",
+                    raw,
+                )
+                if m_fn:
+                    cand = m_fn.group(0).strip()
+                    if allowed_action_call.match(cand):
+                        action = cand
+
+            if not action:
+                action = "wait()"
+
+            if not thought:
+                thought = "I will follow the required format and perform the next GUI action."
+
+            thought = " ".join(thought.split())
+            return f"Thought: {thought}\nAction: {action}"
+
         # 仅在「视觉语言模型 + OSWorld 截图观测」时，走 AutoProcessor + model.generate 路径；
         # 其他任务/模型保持原有文本-only 流程不变。
         use_vl = (
@@ -60,22 +197,57 @@ class BaseTask:
 
         if isinstance(agent, Agent):
             tokenizer = getattr(agent.tokenizer, "tokenizer", agent.tokenizer)
+            conversation_text_only: list[ConversationMessage] | None = None
             conversation = list(client.conversation_start)
             conversation.append(
                 ConversationMessage({"from": "human", "loss": None, "value": state})
             )
-            # 注意：VL 路径下不再对包含 screenshot_base64 的 JSON 文本做 tokenizer.encode，
-            # 否则会把整段 Base64 当作纯文本 token 化，导致 10^6 量级的 token 长度。
-            if not use_vl:
+            # 注意：VL 路径下不要 token 化 screenshot_base64；改为仅抽取可读文本用于 token 统计/回放。
+            if use_vl:
+                conversation_text_only = list(client.conversation_start)
+                conversation_text_only.append(
+                    ConversationMessage(
+                        {"from": "human", "loss": None, "value": _sanitize_obs_text(state)}
+                    )
+                )
+                conversation_tokenized = agent.chat_template.tokenize_conversation(
+                    conversation_text_only, tokenizer, add_generation_prompt=True
+                )
+            else:
                 conversation_tokenized = agent.chat_template.tokenize_conversation(
                     conversation, tokenizer, add_generation_prompt=True
                 )
-            else:
-                conversation_tokenized = None  # type: ignore[assignment]
         elif isinstance(agent, APIAgent):
-            conversation = [APIConversationMessage({"role": "user", "content": client.conversation_start[0]["value"], "reasoning_content": None}),
-                            APIConversationMessage({"role": "assistant", "content": client.conversation_start[1]["value"], "reasoning_content": None}),
-                            APIConversationMessage({"role": "user", "content": state, "reasoning_content": None})]
+            sys_text, conv_start_rest = _split_system_from_conversation_start(
+                list(client.conversation_start)
+            )
+            conversation = []
+            if sys_text is None and self.env_name == "OSWorld":
+                sys_text = _uitars_system_prompt()
+            if sys_text is not None:
+                conversation.append(
+                    APIConversationMessage(
+                        {"role": "system", "content": sys_text, "reasoning_content": None}
+                    )
+                )
+
+            role_map = {"system": "system", "human": "user", "gpt": "assistant"}
+            for m in conv_start_rest:
+                role = role_map.get(m.get("from", "human"), "user")
+                conversation.append(
+                    APIConversationMessage(
+                        {"role": role, "content": str(m.get("value", "")), "reasoning_content": None}
+                    )
+                )
+            conversation.append(
+                APIConversationMessage(
+                    {
+                        "role": "user",
+                        "content": _sanitize_obs_text(state) if self.env_name == "OSWorld" else state,
+                        "reasoning_content": None,
+                    }
+                )
+            )
         else:
             raise NotImplementedError
         rounds = 0
@@ -89,7 +261,17 @@ class BaseTask:
             messages: list[dict[str, Any]] = []
             images_for_conv: list[Any] = []
 
-            for msg in conv:
+            sys_text, conv_rest = _split_system_from_conversation_start(conv)
+            if sys_text is None:
+                sys_text = _uitars_system_prompt()
+            # messages.append(
+            #     {
+            #         "role": "system",
+            #         "content": [{"type": "text", "text": sys_text}],
+            #     }
+            # )
+
+            for msg in conv_rest:
                 role = "user" if msg["from"] == "human" else "assistant"
                 raw_val = msg["value"]
                 text_val = raw_val
@@ -234,6 +416,9 @@ class BaseTask:
                     except Exception:
                         pass
 
+                if self.env_name == "OSWorld":
+                    generated_text = _coerce_uitars_format(generated_text)
+
                 # 统一在此处追加模型回复到对话记录中
                 if isinstance(agent, Agent):
                     conversation.append(
@@ -241,6 +426,12 @@ class BaseTask:
                             {"from": "gpt", "loss": True, "value": generated_text}
                         )
                     )
+                    if use_vl and conversation_text_only is not None:
+                        conversation_text_only.append(
+                            ConversationMessage(
+                                {"from": "gpt", "loss": True, "value": generated_text}
+                            )
+                        )
             elif isinstance(agent, APIAgent):
                 generated_text, generated_reasoning_text = agent.generate(conversation)
                 if generated_reasoning_text:
@@ -248,6 +439,8 @@ class BaseTask:
                         print(f"[Thought] {generated_reasoning_text}")
                     except Exception:
                         pass
+                if self.env_name == "OSWorld":
+                    generated_text = _coerce_uitars_format(generated_text)
                 conversation.append(
                     APIConversationMessage(
                         {"role": "assistant", "content": generated_text, "reasoning_content": generated_reasoning_text}
@@ -264,19 +457,32 @@ class BaseTask:
             )
 
             if isinstance(agent, Agent):
-                env_message = ConversationMessage(
+                env_message_raw = ConversationMessage(
                     {"from": "human", "loss": None, "value": state}
                 )
+                env_message_for_tok = (
+                    ConversationMessage(
+                        {"from": "human", "loss": None, "value": _sanitize_obs_text(state)}
+                    )
+                    if use_vl
+                    else env_message_raw
+                )
                 env_message_tokenized = agent.chat_template.tokenize_conversation_one(
-                    env_message, tokenizer, add_generation_prompt=True
+                    env_message_for_tok, tokenizer, add_generation_prompt=True
                 )
 
-                conversation.append(env_message)
-                conversation_tokenized["text"] += env_message_tokenized["text"]
-                conversation_tokenized["input_ids"] += env_message_tokenized["input_ids"]
-                conversation_tokenized["action_mask"] += env_message_tokenized[
-                    "action_mask"
-                ]
+                conversation.append(env_message_raw)
+                if use_vl and conversation_text_only is not None:
+                    conversation_text_only.append(env_message_for_tok)
+                    conversation_tokenized = agent.chat_template.tokenize_conversation(
+                        conversation_text_only, tokenizer, add_generation_prompt=True
+                    )
+                else:
+                    conversation_tokenized["text"] += env_message_tokenized["text"]
+                    conversation_tokenized["input_ids"] += env_message_tokenized["input_ids"]
+                    conversation_tokenized["action_mask"] += env_message_tokenized[
+                        "action_mask"
+                    ]
             elif isinstance(agent, APIAgent):
                 conversation.append(
                     APIConversationMessage(

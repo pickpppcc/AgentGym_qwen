@@ -947,7 +947,7 @@ class BCTrainer(BaseTrainer):
         self,
         dataloader=None,
         do_sample=False,
-        temperature=1.0,
+        temperature=0.3,
         record_to_file=True,
     ):
         # test
@@ -1049,8 +1049,8 @@ class BCTrainer(BaseTrainer):
         self.accelerator.print("[BC Trainer] Start inference.")
         self.eval_test_dataloader(
             dataloader=self.inference_dataloader,
-            do_sample=True,
-            temperature=1.2,
+            do_sample=False,
+            temperature=0.1,
             record_to_file=True,
         )
 

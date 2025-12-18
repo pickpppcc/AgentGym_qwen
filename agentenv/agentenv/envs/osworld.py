@@ -13,22 +13,15 @@ from agentenv.controller import BaseEnvClient, BaseTask
 from agentenv.controller.types import ConversationMessage, StepOutput
 import sys
 sys.path.append('/data/pengchen/OSWorld/Osworld/OSWorld')
-from mm_agents.uitars15_v1 import parse_action
+from mm_agents.uitars15_v1 import (
+    parse_action,
+    UITARS_ACTION_SPACE,
+    UITARS_USR_PROMPT_THOUGHT,
+    UITARS_SYS_PROMPT_THOUGHT_STRICT,
+)
 
 
 class OSWorldEnvClient(BaseEnvClient):
-    conversation_start = (
-        ConversationMessage({
-            "from": "human",
-            "loss": None,
-            "value": "You control a desktop environment. Think and act to complete the instruction.",
-        }),
-        ConversationMessage({
-            "from": "gpt",
-            "loss": False,
-            "value": "OK. I will act carefully and finish the task.",
-        }),
-    )
 
     def __init__(self, env_server_base: str, data_len: int = 1, timeout: int = 300, create_cfg: dict[str, Any] | None = None, observe_format: str = "text", examples_dir: str | None = None, post_reset_delay_seconds: float | int = 3, step_pause_seconds: float | int = 3, save_dir: str | None = None):
         super().__init__()
@@ -91,6 +84,70 @@ class OSWorldEnvClient(BaseEnvClient):
             self.example_files = collected
             if self.example_files:
                 self.data_len = len(self.example_files)
+
+    @property
+    def conversation_start(self) -> tuple[ConversationMessage, ...]:
+        """
+        构造与 UI-TARS 风格一致的首轮对话 prompt。
+        - 使用 UITARS_USR_PROMPT_THOUGHT 作为模板；
+        - {instruction} 来自当前 OSWorld 任务的 instruction 字段；
+        - {action_space} 使用 UITARS_ACTION_SPACE；
+        - {language} 固定为英文，方便大多数模型对齐（如需中文可自行改成 'Chinese'）。
+        """
+        try:
+            instr = self.get_instruction() or ""
+        except Exception:
+            instr = ""
+
+        user_prompt = UITARS_USR_PROMPT_THOUGHT.format(
+            instruction=instr,
+            action_space=UITARS_ACTION_SPACE,
+            language="English",
+        )
+
+        # 在 UITARS 基础模板后追加一个 few-shot 示例，帮助 Qwen 学会正确的 Thought / Action 格式。
+        # 这里示例一个简单的“打开浏览器并访问 Amazon 页面”的步骤。
+        example_block = (
+            "\n\n"
+            "## Example (format demonstration)\n"
+            "Below is an example of the expected output format. "
+            "Follow this style in your own responses.\n\n"
+            "User Instruction: Open the browser and go to https://www.amazon.com, then click the 'Sign in' button.\n"
+            "Observation: The desktop is visible and a browser icon is on the taskbar.\n\n"
+            "Thought: I should first click the browser icon on the taskbar to open the browser, "
+            "then I can type the Amazon URL in the address bar.\n"
+            "Action: click(start_box='(120,1040)')\n\n"
+            "Now, for the current task, think step by step and respond in the same Thought and Action format."
+        )
+
+        full_prompt = user_prompt + example_block
+
+        # NOTE: keep the strict system prompt as a first "human" message so that:
+        # - Text-only chat templates (that may not support system role) won't break;
+        # - API/VL paths can promote it to a real system role and drop it from user content.
+        return (
+            # ConversationMessage(
+            #     {
+            #         "from": "human",
+            #         "loss": None,
+            #         "value": UITARS_SYS_PROMPT_THOUGHT_STRICT,
+            #     }
+            # ),
+            ConversationMessage(
+                {
+                    "from": "human",
+                    "loss": None,
+                    "value": full_prompt,
+                }
+            ),
+            ConversationMessage(
+                {
+                    "from": "gpt",
+                    "loss": False,
+                    "value": "OK. I will act carefully and finish the task.",
+                }
+            ),
+        )
 
     def __len__(self) -> int:
         return self.data_len
@@ -178,10 +235,17 @@ class OSWorldEnvClient(BaseEnvClient):
                 done=False,
             )
         act = action_matches[-1] if action_matches else action
+        if isinstance(act, str):
+            act = act.strip()
 
         def _parse_point(s: str) -> tuple[float, float] | None:
             try:
                 inner = s.strip().strip("'").strip('"').strip()
+                inner = (
+                    inner.replace("<|box_start|>", "")
+                    .replace("<|box_end|>", "")
+                    .strip()
+                )
                 if inner.startswith("(") and inner.endswith(")"):
                     x_str, y_str = inner[1:-1].split(",")
                     return float(x_str.strip()), float(y_str.strip())
@@ -279,6 +343,12 @@ class OSWorldEnvClient(BaseEnvClient):
                 act_or_dict = _to_computer13(act)
         except Exception:
             act_or_dict = _to_computer13(act)
+
+        # 兜底：避免把未知字符串透传到 server（server 侧 controller 期望 dict）。
+        if isinstance(act_or_dict, str):
+            s = act_or_dict.strip().upper()
+            if s not in {"WAIT", "DONE", "FAIL"}:
+                act_or_dict = "WAIT"
         resp = self._post("step", {"action": act_or_dict, "pause": self._step_pause_seconds})
         self.info = resp
         # 自增步号并保存截图
@@ -391,5 +461,3 @@ class OSWorldTask(BaseTask):
 
     def __init__(self, client_args: Mapping[str, Any], *args, n_clients: int = 1, **kwargs) -> None:
         super().__init__(client_args, n_clients, *args, **kwargs)
-
-

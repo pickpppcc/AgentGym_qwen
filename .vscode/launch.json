@@ -67,6 +67,34 @@
           "--debug_max_tokens", "512",
           "--assistant_only_loss", "true"
         ]
+      },
+      {
+        "name": "Debug: agent_osworld server (uvicorn)",
+        "type": "python",
+        "request": "launch",
+        "module": "uvicorn",
+        "console": "integratedTerminal",
+        "cwd": "/data/pengchen/OSWorld/Osworld/AgentGym2/AgentGym/agent-osworld",
+        "justMyCode": false,
+        "env": {
+          "PATH": "/home/pengchen/miniconda3/envs/osworld/bin:${env:PATH}",
+          "PYTHONPATH": "/data/pengchen/OSWorld/Osworld/AgentGym2/AgentGym/agent-osworld:/data/pengchen/OSWorld/Osworld/AgentGym2/AgentGym:${env:PYTHONPATH}"
+        },
+        "args": [
+          "agent_osworld.server:app",
+          "--host", "127.0.0.1",
+          "--port", "36001"
+        ]
+      }
+    ],
+    "compounds": [
+      {
+        "name": "Debug: osworld server + bc client",
+        "configurations": [
+          "Debug: agent_osworld server (uvicorn)",
+          "Debug: behavioral_clone_osworld_smoke (AgentGym2)"
+        ],
+        "stopAll": true
       }
     ]
   }

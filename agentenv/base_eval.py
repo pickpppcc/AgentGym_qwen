@@ -11,6 +11,7 @@ from mm_agents.uitars15_v1 import (
     UITARS_NORMAL_ACTION_SPACE,
     UITARS_USR_PROMPT_NOTHOUGHT,
     UITARS_USR_PROMPT_THOUGHT,
+    UITARS_SYS_PROMPT_THOUGHT_STRICT,
     add_box_token,
 )
 
@@ -149,7 +150,7 @@ class VisionAPIAgent(APIAgent):
         msgs = [
             {
                 "role": "system",
-                "content": [{"type": "text", "text": "You are a helpful assistant."}]
+                "content": [{"type": "text", "text": UITARS_SYS_PROMPT_THOUGHT_STRICT}]
             },
             {
                 "role": "user",
