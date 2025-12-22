@@ -148,7 +148,7 @@ def main():
 
     # 根据路径与 config.json 识别是否为视觉语言模型（Qwen2-VL / Qwen3-VL 等）
     model_path_lower = args.model_train_path.lower()
-    is_vl_by_name = any(k in model_path_lower for k in ["qwen2-vl", "qwen3-vl", "qwen-vl"])  # 名称启发式
+    is_vl_by_name = any(k in model_path_lower for k in ["qwen2-vl", "qwen3-vl", "qwen-vl", "qwen3-4b", "qwen3-8b"])  # 名称启发式
 
     is_vl_by_config = False
     try:

@@ -1,12 +1,17 @@
+#!/usr/bin/env bash
 set -euo pipefail
-exp_name="behavioral_clone_osworld_smoke"
 
-n_epochs='1'
+# Multi-task launcher (OSWorld) - tuned from .vscode/launch.json.
+# Run from: /data/pengchen/OSWorld/Osworld/AgentGym2/AgentGym/agentenv
+
+exp_name="${EXP_NAME:-behavioral_clone_osworld_smoke}"
+
+n_epochs="${N_EPOCHS:-2000}"
 # 可选：通过 CUDA_VISIBLE_DEVICES 指定卡列表，或在外部传入
 # export CUDA_VISIBLE_DEVICES=0
 # GPU 选择：支持命令行传入（例如："1 2 3" 或 "1,2,3"），也支持环境变量 GPUS
 # 如遇 OOM 可减少卡数/切单卡
-GPUS="1"
+GPUS="${GPUS:-5}"
 export GPUS
 export DEEPSPEED_COMM_AUTO_MPI_DISCOVERY=0
 GPU_LIST_INPUT="${GPUS:-$*}"
@@ -56,16 +61,16 @@ config_file="${ACC_CFG_FILE}"
 LAUNCH_CFG=(--config_file "${config_file}")
 
 # training arguments
-train_file='/data/pengchen/OSWorld/Osworld/OSWorld/processed_conversations_train.json'
-inference_file='/data/pengchen/OSWorld/Osworld/OSWorld/processed_conversations_test.json'
-model_train_path="/data/pengchen/OSWorld/Osworld/models/Qwen2-VL-2B"
+train_file='/data/pengchen/OSWorld/Osworld/AgentGym2/AgentGym/data/test_real_smoke_4turn.json'
+inference_file='/data/pengchen/OSWorld/Osworld/AgentGym2/AgentGym/data/test_real_smoke_4turn.json'
+model_train_path="/data/pengchen/OSWorld/Osworld/models/Qwen/Qwen3-VL-4B-Instruct"
 # use absolute path to avoid cwd issues
 model_save_path="$(pwd)/outputs/${exp_name}"
 
-batch_size="1"
+batch_size="4"
 eval_batch_size="1"
-gradient_accumulation_steps="2"
-max_input_length="384"
+gradient_accumulation_steps="4"
+max_input_length="7200"
 num_workers="0"
 learning_rate="1e-5"
 weight_decay="0"
@@ -75,7 +80,7 @@ seed="42"
 
 logging_epoch_freq="1"
 evaluating_epoch_freq="100"
-saving_epoch_freq="1"
+saving_epoch_freq="100"
 logging_step_freq="5"
 
 # wandb config
@@ -84,19 +89,19 @@ wandb_project="agentenv"
 wandb_run_name="${exp_name}"
 
 # environment parameters
-data_len="200"
+data_len="15"
 timeout="2400"
 
 # eval
 task_list=("osworld")
-test_file_list=("/data/pengchen/OSWorld/Osworld/OSWorld/evaluation_examples/test_small.json")
+test_file_list=("/data/pengchen/OSWorld/Osworld/AgentGym2/AgentGym/data/test_real_smoke_4turn.json")
 # task_list=("webshop" "alfworld" "textcraft" "sciworld")
 # # eval parameters
 # test_file_list=("PATH/TO/webshop_test.json" "PATH/TO/alfworld_test.json" "PATH/TO/textcraft_test.json" "PATH/TO/sciworld_test_small.json")
 do_sample="False"
 temperature="1.0"
 sample_num="2"
-max_round_list=("6" "30" "20" "30")
+max_round_list=("15" "30" "20" "30")
 env_server_base_list=("http://127.0.0.1:36001" "http://127.0.0.1:36002" "http://127.0.0.1:36008" "http://127.0.0.1:36010")
 
 mkdir -p "${model_save_path}"
@@ -150,21 +155,16 @@ accelerate launch \
         --data_len "${data_len}" \
         --timeout "${timeout}" \
         --observe_format "screenshot_base64" \
-        --create_cfg_json '{
-          "provider_name":"docker",
-          "path_to_vm":"/data/pengchen/OSWorld/Osworld/AgentGym/agent-osworld/docker_vm_data/Ubuntu.qcow2",
-          "snapshot_name":"init_state",
-          "action_space":"computer_13",
-          "require_a11y_tree":false,
-          "require_terminal":false,
-          "headless":true
-        }' \
+        --create_cfg_json '{"provider_name":"docker","auto_evaluate":"True","path_to_vm":"/data/pengchen/OSWorld/env/Ubuntu.qcow2","snapshot_name":"init_state","action_space":"computer_13","require_a11y_tree":false,"require_terminal":false,"headless":true}' \
         --use_deepspeed true \
         --examples_dir "/data/pengchen/OSWorld/Osworld/OSWorld/evaluation_examples/examples/chrome" \
         --save_dir "/data/pengchen/OSWorld/Osworld/OSWorld/results/pyautogui/screenshot/ui-tars/agentgym/chrome" \
         --post_reset_delay_seconds "3" \
         --step_pause_seconds "3" \
-        --train_max_samples "10"
+        --train_max_samples "20000" \
+        --debug "true" \
+        --debug_max_tokens "512" \
+        --assistant_only_loss "true"
                 
 # step2: eval on test dataset (only if trained model folder exists)
 if [ -d "${model_save_path}/train_epoch_${n_epochs}" ]; then

@@ -36,6 +36,7 @@ class OSWorldEnvClient(BaseEnvClient):
         self._run_dir: str | None = None
         self._current_task_id: str | None = None
         self._step_index: int = 0
+        self._recording_active: bool = False
 
         # 创建 OSWorld 环境实例；若后端返回 500 等错误，尽量把服务端返回的报错信息打出来，方便排查。
         try:
@@ -162,6 +163,31 @@ class OSWorldEnvClient(BaseEnvClient):
         res = requests.get(f"{self.env_server_base}/{path}?id={self.env_id}", timeout=self.timeout)
         res.raise_for_status()
         return res.json()
+
+    def _maybe_end_recording(self) -> None:
+        try:
+            if not self._recording_active:
+                return
+            if not self._run_dir:
+                return
+            dest = os.path.join(self._run_dir, "recording.mp4")
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            self._post("end_recording", {"dest": dest})
+        except Exception:
+            pass
+        finally:
+            self._recording_active = False
+
+    def _maybe_start_recording(self) -> None:
+        try:
+            if self._recording_active:
+                return
+            if not self._run_dir:
+                return
+            self._post("start_recording", {})
+            self._recording_active = True
+        except Exception:
+            self._recording_active = False
 
     def observe(self) -> str:
         if self.info:
@@ -366,6 +392,9 @@ class OSWorldEnvClient(BaseEnvClient):
         )
 
     def reset(self, data_idx: int = 0) -> dict[str, Any]:
+        # End previous episode recording (if any) before starting a new task.
+        self._maybe_end_recording()
+
         task_config = None
         sel = None
         if self.example_files:
@@ -398,6 +427,8 @@ class OSWorldEnvClient(BaseEnvClient):
                 self._run_dir = os.path.join(self._save_dir, self._current_task_id)
                 os.makedirs(self._run_dir, exist_ok=True)
                 self._save_observation_snapshot(resp.get("observation"), os.path.join(self._run_dir, "reset.png"))
+                # Start recording for this task; will be stopped on next reset/close.
+                self._maybe_start_recording()
         except Exception:
             pass
         # 给 Chrome/应用一点时间完成启动渲染，避免首帧看不到窗口
@@ -417,6 +448,7 @@ class OSWorldEnvClient(BaseEnvClient):
         return resp
 
     def close(self) -> dict[str, Any]:
+        self._maybe_end_recording()
         return self._post("close", {})
 
     @staticmethod

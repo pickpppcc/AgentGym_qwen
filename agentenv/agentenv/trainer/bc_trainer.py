@@ -92,7 +92,7 @@ class BCTrainer(BaseTrainer):
                     "overlap_comm": True,
                     "contiguous_gradients": True,
                     # 启用优化器状态 CPU offload 缓解显存压力
-                    "offload_optimizer": {"device": "cpu", "pin_memory": True},
+                    "offload_optimizer": {"device": "cpu"},
                     "offload_param": {"device": "none"},
                     # 允许保存时聚合 16bit 权重，便于 unwrap 并保存
                     "gather_16bit_weights_on_model_save": True,
@@ -566,10 +566,22 @@ class BCTrainer(BaseTrainer):
         """
 
         def collate_fn(batch):
-            result = {
-                "data_idxs": [int(item["item_id"].split("_")[-1]) for item in batch]
-            }
-            return result
+            data_idxs: list[int] = []
+            task_ids: list[str] = []
+            item_ids: list[str] = []
+            for item in batch:
+                item_id = str(item.get("item_id", ""))
+                item_ids.append(item_id)
+                # Convention: "<task_id>_<idx>"
+                try:
+                    data_idxs.append(int(item_id.rsplit("_", 1)[-1]))
+                except Exception:
+                    data_idxs.append(-1)
+                try:
+                    task_ids.append(item_id.rsplit("_", 1)[0])
+                except Exception:
+                    task_ids.append(item_id)
+            return {"data_idxs": data_idxs, "task_ids": task_ids, "item_ids": item_ids}
 
         # 在单进程/未初始化分布式的情况下，避免进入 barrier
         if getattr(self.accelerator, "num_processes", 1) == 1:
@@ -964,6 +976,9 @@ class BCTrainer(BaseTrainer):
             desc="Evaluation Gen Loop",
         ):
             data_idxs = batch["data_idxs"]
+            task_ids = batch.get("task_ids")
+            if task_ids:
+                self.accelerator.print("==== Batch inference task ids ====", task_ids)
             self.accelerator.print("==== Batch inference data idxs ====", data_idxs)
             with torch.no_grad():
                 exps = self.eval(

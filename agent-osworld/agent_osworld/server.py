@@ -45,6 +45,10 @@ class CreateRequestBody(BaseModel):
     require_a11y_tree: Optional[bool] = None
     require_terminal: Optional[bool] = None
     os_type: Optional[str] = None
+    # AgentGym-specific: automatically call OSWorld DesktopEnv.evaluate() after each step
+    # and mark done when score reaches the threshold.
+    auto_evaluate: Optional[bool] = None
+    done_score_threshold: Optional[float] = None
 
 
 class StepRequestBody(BaseModel):
@@ -63,6 +67,11 @@ class CloseRequestBody(BaseModel):
     id: int
 
 
+class RecordingRequestBody(BaseModel):
+    id: int
+    dest: Optional[str] = None
+
+
 class OSWorldServer:
     """环境服务器包装器，管理多个 OSWorld DesktopEnv 实例。"""
 
@@ -72,6 +81,8 @@ class OSWorldServer:
         self.env: Dict[int, DesktopEnv] = {}
         self.info: Dict[int, Dict[str, Any]] = {}
         self.ls: list[int] = []
+        self._auto_evaluate: Dict[int, bool] = {}
+        self._done_score_threshold: Dict[int, float] = {}
 
     def _next_id(self) -> int:
         with self._lock:
@@ -101,6 +112,8 @@ class OSWorldServer:
         ob = env.reset(task_config=None)
         self.env[env_id] = env
         self.ls.append(env_id)
+        self._auto_evaluate[env_id] = bool(cfg.get("auto_evaluate")) if cfg.get("auto_evaluate") is not None else False
+        self._done_score_threshold[env_id] = float(cfg.get("done_score_threshold")) if cfg.get("done_score_threshold") is not None else 1.0
         self.info[env_id] = {
             "observation": _sanitize_observation(ob),
             "reward": 0.0,
@@ -113,11 +126,35 @@ class OSWorldServer:
         env = self.env[env_id]
         ob, reward, done, info = env.step(action, pause=pause)
         ob_json = _sanitize_observation(ob)
+        score = None
+        eval_error: Optional[str] = None
+        if self._auto_evaluate.get(env_id, False) and hasattr(env, "evaluator"):
+            try:
+                raw = env.evaluate()
+                score = float(env.evaluate())
+                reward = score
+                threshold = float(self._done_score_threshold.get(env_id, 1.0))
+                if score >= threshold:
+                    done = True
+            except Exception as e:
+                eval_error = str(e)
+                try:
+                    info = dict(info) if isinstance(info, dict) else {"info": info}
+                    info["eval_error"] = str(e)
+                except Exception:
+                    pass
+        elif self._auto_evaluate.get(env_id, False) and not hasattr(env, "evaluator"):
+            eval_error = "auto_evaluate is enabled but env.evaluator is not set; did you /reset with task_config?"
         payload = {
             "observation": ob_json,
             "reward": float(reward),
             "done": bool(done),
         }
+        if score is not None:
+            payload["score"] = float(score)
+            payload["success"] = bool(payload["done"])
+        if eval_error:
+            payload["eval_error"] = eval_error
         # 缓存最近一次摘要
         try:
             self.info[env_id] = payload | {"info": info, "action": action}
@@ -137,11 +174,21 @@ class OSWorldServer:
         env = self.env[env_id]
         ob = env.reset(task_config=task_config, seed=seed)
         ob_json = _sanitize_observation(ob)
-        payload = {
+        payload: Dict[str, Any] = {
             "observation": ob_json,
             "reward": 0.0,
             "done": False,
         }
+        if self._auto_evaluate.get(env_id, False) and hasattr(env, "evaluator"):
+            try:
+                score = float(env.evaluate())
+                payload["reward"] = float(score)
+                threshold = float(self._done_score_threshold.get(env_id, 1.0))
+                payload["done"] = bool(score >= threshold)
+                payload["score"] = float(score)
+                payload["success"] = bool(payload["done"])
+            except Exception:
+                pass
         self.info[env_id] = payload
         try:
             obs_keys = list(ob_json.keys()) if isinstance(ob_json, dict) else []
@@ -166,11 +213,37 @@ class OSWorldServer:
             env = self.env.pop(env_id)
             env.close()
             self.info.pop(env_id, None)
+            self._auto_evaluate.pop(env_id, None)
+            self._done_score_threshold.pop(env_id, None)
             return {"closed": True}
         except KeyError:
             return {"closed": False, "error": "Env not exist"}
         except Exception as e:  # pylint: disable=broad-except
             return {"closed": False, "error": str(e)}
+
+    def start_recording(self, env_id: int) -> Dict[str, Any]:
+        env = self.env[env_id]
+        ctrl = getattr(env, "controller", None)
+        if ctrl is None or not hasattr(ctrl, "start_recording"):
+            return {"ok": False, "error": "controller.start_recording not available"}
+        try:
+            ctrl.start_recording()
+            return {"ok": True}
+        except Exception as e:  # pylint: disable=broad-except
+            return {"ok": False, "error": str(e)}
+
+    def end_recording(self, env_id: int, dest: str) -> Dict[str, Any]:
+        env = self.env[env_id]
+        ctrl = getattr(env, "controller", None)
+        if ctrl is None or not hasattr(ctrl, "end_recording"):
+            return {"ok": False, "error": "controller.end_recording not available"}
+        if not dest:
+            return {"ok": False, "error": "dest is required"}
+        try:
+            ctrl.end_recording(dest)
+            return {"ok": True, "dest": dest}
+        except Exception as e:  # pylint: disable=broad-except
+            return {"ok": False, "error": str(e)}
 
 
 app = FastAPI()
@@ -228,6 +301,15 @@ def close(body: CloseRequestBody):
     return server.close(body.id)
 
 
+@app.post("/start_recording")
+def start_recording(body: RecordingRequestBody):
+    return server.start_recording(body.id)
+
+
+@app.post("/end_recording")
+def end_recording(body: RecordingRequestBody):
+    return server.end_recording(body.id, body.dest or "")
+
 @app.get("/last")
 def get_last(id: int):  # noqa: A002 - 保持 API 语义
     return server.last(id)
@@ -236,4 +318,3 @@ def get_last(id: int):  # noqa: A002 - 保持 API 语义
 @app.get("/health")
 def health():
     return {"status": "ok"}
-
