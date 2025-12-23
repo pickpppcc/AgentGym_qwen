@@ -106,6 +106,14 @@ class TrainingArguments:
     evaluating_epoch_freq: int = field(default=1)
     logging_epoch_freq: int = field(default=1)
     saving_epoch_freq: int = field(default=1)
+    save_latest_only: bool = field(
+        default=False,
+        metadata={"help": "If True, only keep the latest train_epoch_* checkpoint (equivalent to --save_total_limit 1)."},
+    )
+    save_total_limit: Optional[int] = field(
+        default=None,
+        metadata={"help": "Maximum number of train_epoch_* checkpoints to keep; older ones will be deleted. Default keeps all."},
+    )
     logging_step_freq: int = field(default=None)
     seed: int = field(default=42)
     max_input_length: int = field(default=700)
@@ -203,6 +211,7 @@ seed="42"
 logging_epoch_freq="1"
 evaluating_epoch_freq="100"
 saving_epoch_freq="1"
+save_latest_only="False"
 logging_step_freq="5"
 
 # wandb config
@@ -246,6 +255,7 @@ accelerate launch \
         --evaluating_epoch_freq "${evaluating_epoch_freq}" \
         --logging_epoch_freq "${logging_epoch_freq}" \
         --saving_epoch_freq "${saving_epoch_freq}" \
+        --save_latest_only "${save_latest_only}" \
         --logging_step_freq "${logging_step_freq}" \
         --seed "${seed}" \
         --max_input_length "${max_input_length}" \

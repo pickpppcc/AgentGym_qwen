@@ -71,6 +71,14 @@ class TrainingArguments:
     evaluating_epoch_freq: int = field(default=1)
     logging_epoch_freq: int = field(default=1)
     saving_epoch_freq: int = field(default=1)
+    save_latest_only: bool = field(
+        default=False,
+        metadata={"help": "If True, only keep the latest train_epoch_* checkpoint (equivalent to --save_total_limit 1)."},
+    )
+    save_total_limit: Optional[int] = field(
+        default=None,
+        metadata={"help": "Maximum number of train_epoch_* checkpoints to keep; older ones will be deleted. Default keeps all."},
+    )
     logging_step_freq: int = field(default=None)
     seed: int = field(default=42)
     max_input_length: int = field(default=700)

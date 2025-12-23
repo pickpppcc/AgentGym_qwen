@@ -1,6 +1,8 @@
 import json
 import shutil
 import os
+import re
+from datetime import datetime
 from collections import defaultdict
 from dataclasses import asdict
 from datetime import timedelta
@@ -67,6 +69,8 @@ class BCTrainer(BaseTrainer):
         # log dict
         self.best_eval_log_dict = {}
         self.summary_log_dict = {}
+        self._run_log_path = None
+        self._run_log_fh = None
 
         self.create_accelerator()
         self.set_seed()
@@ -152,6 +156,76 @@ class BCTrainer(BaseTrainer):
                 ],
             ) 
             self.accelerator.print("[Accelerate] DeepSpeed enabled: False | Using DDP")
+
+    def _make_experiment_slug(self) -> str:
+        a = self.args
+
+        def _short_model(p: str) -> str:
+            if not p:
+                return "model"
+            p = str(p).rstrip("/").replace("\\", "/")
+            return p.split("/")[-1] or "model"
+
+        parts = [
+            f"task={a.get('task_name', 'task')}",
+            f"model={_short_model(a.get('model_train_path', ''))}",
+            f"lr={a.get('learning_rate', 'na')}",
+            f"bs={a.get('batch_size', 'na')}",
+            f"gas={a.get('gradient_accumulation_steps', 'na')}",
+            f"maxlen={a.get('max_input_length', 'na')}",
+            f"epochs={a.get('n_epochs', 'na')}",
+            f"seed={a.get('seed', 'na')}",
+            f"ds={int(bool(a.get('use_deepspeed', False)))}",
+            f"savefreq={a.get('saving_epoch_freq', 'na')}",
+        ]
+        slug = "__".join(parts)
+        slug = re.sub(r"[^A-Za-z0-9._=\\-]+", "_", slug)
+        slug = re.sub(r"_+", "_", slug).strip("_")
+        return slug[:200] if len(slug) > 200 else slug
+
+    def _open_run_log(self, model_save_path: str) -> None:
+        if not self.accelerator.is_main_process:
+            return
+        try:
+            os.makedirs(model_save_path, exist_ok=True)
+            slug = self._make_experiment_slug()
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            base = os.path.join(model_save_path, f"train__{slug}__{ts}")
+
+            log_path = base + ".log"
+            i = 2
+            while os.path.exists(log_path):
+                log_path = base + f"__{i}.log"
+                i += 1
+            args_path = log_path[:-4] + ".args.json"
+
+            with open(args_path, "w", encoding="utf-8") as f:
+                json.dump(self.args, f, ensure_ascii=False, indent=2, sort_keys=True)
+            self._run_log_fh = open(log_path, "a", encoding="utf-8")
+            self._run_log_path = log_path
+            self._run_log_fh.write(f"[run] log_path={log_path}\n")
+            self._run_log_fh.write(f"[run] args_path={args_path}\n")
+            self._run_log_fh.flush()
+        except Exception:
+            self._run_log_fh = None
+            self._run_log_path = None
+
+    def _close_run_log(self) -> None:
+        try:
+            if self._run_log_fh is not None:
+                self._run_log_fh.flush()
+                self._run_log_fh.close()
+        finally:
+            self._run_log_fh = None
+
+    def _log_line(self, msg: str) -> None:
+        self.accelerator.print(msg)
+        if self.accelerator.is_main_process and self._run_log_fh is not None:
+            try:
+                self._run_log_fh.write(msg + "\n")
+                self._run_log_fh.flush()
+            except Exception:
+                pass
 
     def set_seed(self):
         """
@@ -700,6 +774,43 @@ class BCTrainer(BaseTrainer):
             # 非关键失败忽略
             pass
 
+    def _prune_epoch_checkpoints(self, model_save_path: str, keep_last: int) -> None:
+        if keep_last is None:
+            return
+        try:
+            keep_last = int(keep_last)
+        except Exception:
+            return
+        if keep_last <= 0:
+            return
+
+        pattern = re.compile(r"^train_epoch_(\d+)$")
+        checkpoints = []
+        for name in os.listdir(model_save_path):
+            full_path = os.path.join(model_save_path, name)
+            if not os.path.isdir(full_path):
+                continue
+            m = pattern.match(name)
+            if not m:
+                continue
+            try:
+                epoch = int(m.group(1))
+            except Exception:
+                continue
+            checkpoints.append((epoch, full_path))
+
+        checkpoints.sort(key=lambda x: x[0])
+        if len(checkpoints) <= keep_last:
+            return
+
+        to_delete = checkpoints[: max(0, len(checkpoints) - keep_last)]
+        for _, path in to_delete:
+            try:
+                shutil.rmtree(path)
+            except Exception:
+                # 非关键失败忽略（例如并发/权限/文件占用）
+                pass
+
     def init_train_stuff(self):
         """
         Initialize the training stuff, including the optimizer, scheduler, etc.
@@ -883,6 +994,15 @@ class BCTrainer(BaseTrainer):
         saving_epoch_freq = self.args["saving_epoch_freq"]
         model_save_path = self.args["model_save_path"]
         os.makedirs(model_save_path, exist_ok=True)
+        self._open_run_log(model_save_path)
+        if self.accelerator.is_main_process and self._run_log_path is not None:
+            self._log_line(f"[run] start_time={datetime.now().isoformat(timespec='seconds')}")
+            self._log_line(f"[run] experiment={os.path.basename(self._run_log_path)}")
+        # 兼容：只保留最近的 checkpoint（或通过 save_total_limit 限制数量）
+        save_latest_only = bool(self.args.get("save_latest_only", False))
+        save_total_limit = self.args.get("save_total_limit", None)
+        if save_latest_only:
+            save_total_limit = 1
         with tqdm(range(1, n_epochs + 1), total=n_epochs, disable=False) as t:
             for epoch in t:
                 train_epoch_result_dict, global_step = self.train_one_epoch(
@@ -946,14 +1066,19 @@ class BCTrainer(BaseTrainer):
                         k: f"{v:.5g}" if isinstance(v, float) else v
                         for k, v in log_dict.items()
                     }
-                    self.accelerator.print(
-                        f"[E={epoch}/{self.args['n_epochs']}, S={global_step}] {log_dict}"
-                    )
+                    self._log_line(f"[E={epoch}/{self.args['n_epochs']}, S={global_step}] {log_dict}")
 
                 if saving_epoch_freq is not None and epoch % saving_epoch_freq == 0:
                     # if is_best:
                     save_path = os.path.join(model_save_path, f"train_epoch_{epoch}")
                     self.save_model(self.agent.model, self.agent.tokenizer, save_path)
+                    self.accelerator.wait_for_everyone()
+                    if self.accelerator.is_main_process and save_total_limit is not None:
+                        self._prune_epoch_checkpoints(model_save_path, save_total_limit)
+                    self.accelerator.wait_for_everyone()
+        if self.accelerator.is_main_process and self._run_log_path is not None:
+            self._log_line(f"[run] end_time={datetime.now().isoformat(timespec='seconds')}")
+        self._close_run_log()
 
     def eval_test_dataloader(
         self,

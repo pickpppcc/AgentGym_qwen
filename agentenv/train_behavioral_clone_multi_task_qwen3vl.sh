@@ -39,9 +39,9 @@ NUM_GPUS="${NUM_GPUS:-$#}"
 main_process_port="${MAIN_PROCESS_PORT:-8897}"
 
 # ---- Args (match launch.json) ----
-train_file="/data/pengchen/OSWorld/Osworld/AgentGym2/AgentGym/data/test_real_smoke_4turn.json"
-inference_file="/data/pengchen/OSWorld/Osworld/AgentGym2/AgentGym/data/test_real_smoke_4turn.json"
-test_file="/data/pengchen/OSWorld/Osworld/AgentGym2/AgentGym/data/test_real_smoke_4turn.json"
+train_file="/data/pengchen/OSWorld/Osworld/AgentGym2/AgentGym/data/processed_conversations_vl_train.json"
+inference_file="/data/pengchen/OSWorld/Osworld/AgentGym2/AgentGym/data/processed_conversations_vl_validation.json"
+test_file="/data/pengchen/OSWorld/Osworld/AgentGym2/AgentGym/data/processed_conversations_vl_test.json"
 
 model_train_path="/data/pengchen/OSWorld/Osworld/models/Qwen/Qwen3-VL-4B-Instruct"
 model_save_path="/data/pengchen/OSWorld/Osworld/AgentGym2/AgentGym/agentenv/outputs/behavioral_clone_osworld_smoke"
@@ -74,6 +74,7 @@ accelerate launch \
   --evaluating_epoch_freq "100" \
   --logging_epoch_freq "1" \
   --saving_epoch_freq "100" \
+  --save_latest_only "true" \
   --logging_step_freq "5" \
   --seed "42" \
   --max_input_length "7200" \
@@ -96,4 +97,3 @@ accelerate launch \
   --debug "true" \
   --debug_max_tokens "512" \
   --assistant_only_loss "true"
-

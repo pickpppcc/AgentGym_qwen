@@ -81,6 +81,7 @@ seed="42"
 logging_epoch_freq="1"
 evaluating_epoch_freq="100"
 saving_epoch_freq="100"
+save_latest_only="True"
 logging_step_freq="5"
 
 # wandb config
@@ -143,6 +144,7 @@ accelerate launch \
         --evaluating_epoch_freq "${evaluating_epoch_freq}" \
         --logging_epoch_freq "${logging_epoch_freq}" \
         --saving_epoch_freq "${saving_epoch_freq}" \
+        --save_latest_only "${save_latest_only}" \
         --logging_step_freq "${logging_step_freq}" \
         --seed "${seed}" \
         --max_input_length "${max_input_length}" \
