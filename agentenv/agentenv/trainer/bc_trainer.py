@@ -95,8 +95,8 @@ class BCTrainer(BaseTrainer):
                     "stage": 3,
                     "overlap_comm": True,
                     "contiguous_gradients": True,
-                    # 启用优化器状态 CPU offload 缓解显存压力
-                    "offload_optimizer": {"device": "cpu"},
+                    # No CPU offload: shard across GPUs only.
+                    "offload_optimizer": {"device": "none"},
                     "offload_param": {"device": "none"},
                     # 允许保存时聚合 16bit 权重，便于 unwrap 并保存
                     "gather_16bit_weights_on_model_save": True,
@@ -108,7 +108,7 @@ class BCTrainer(BaseTrainer):
                 "activation_checkpointing": {
                     "partition_activations": True,
                     "contiguous_memory_optimization": False,
-                    "cpu_checkpointing": True,
+                    "cpu_checkpointing": False,
                     "number_checkpoints": None,
                     "synchronize_checkpoint_boundary": False,
                     "profile": False
@@ -1379,6 +1379,30 @@ class QwenVLBCTrainer(BCTrainer):
                             if merged_txt:
                                 text_val = merged_txt
                             screenshot_b64 = inner.get("screenshot_base64")
+                    except Exception:
+                        pass
+
+                # 防御：若 JSON 解析失败，raw_val 可能包含巨大的 base64（screenshot_base64），
+                # 直接进入 tokenizer 会导致 token 数爆炸并触发 OOM。
+                # 真实图像仍通过 screenshot_b64 -> images 路径传入 processor。
+                if isinstance(text_val, str) and len(text_val) > 10000 and (
+                    ("screenshot_base64" in text_val)
+                    or ("data:image" in text_val)
+                    or ("base64," in text_val)
+                ):
+                    try:
+                        import re
+
+                        text_val = re.sub(
+                            r"(data:image/[^;\\s]+;base64,)[A-Za-z0-9+/=]{200,}",
+                            r"\\1[BASE64_OMITTED]",
+                            text_val,
+                        )
+                        text_val = re.sub(
+                            r"[A-Za-z0-9+/]{1000,}={0,2}",
+                            "[BASE64_OMITTED]",
+                            text_val,
+                        )
                     except Exception:
                         pass
 
