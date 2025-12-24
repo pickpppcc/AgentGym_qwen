@@ -1539,6 +1539,7 @@ class QwenVLBCTrainer(BCTrainer):
                 "labels": labels.to(dtype=torch.long),
             }
 
+            print(f"input_ids length:{input_ids.shape}")
             # 仅当文本中真实存在图像 token 时，才把图像特征传给模型；
             # 否则会出现 “tokens: 0, features > 0” 的错配。
             attach_images = (
