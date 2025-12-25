@@ -96,7 +96,7 @@ class BCTrainer(BaseTrainer):
                     "overlap_comm": True,
                     "contiguous_gradients": True,
                     # No CPU offload: shard across GPUs only.
-                    "offload_optimizer": {"device": "none"},
+                    "offload_optimizer": {"device": "cpu", "pin_memory": True},
                     "offload_param": {"device": "none"},
                     # 允许保存时聚合 16bit 权重，便于 unwrap 并保存
                     "gather_16bit_weights_on_model_save": True,
@@ -1262,6 +1262,48 @@ class QwenVLBCTrainer(BCTrainer):
             except Exception:
                 image_token_ids = set()
 
+        # If training data already contains decoded image file paths (merged JSONL),
+        # resolve relative paths against the train_file directory.
+        train_file_dir = None
+        try:
+            tf = args.get("train_file")
+            if tf:
+                train_file_dir = os.path.dirname(os.path.abspath(os.path.expanduser(str(tf))))
+        except Exception:
+            train_file_dir = None
+
+        prev_image_rounds = int(args.get("vl_prev_image_rounds", 4) or 4)
+        prev_downsample = float(args.get("vl_prev_downsample", 0.5) or 0.5)
+
+        def _resolve_img_path(p: str) -> str:
+            if not p:
+                return p
+            if os.path.isabs(p):
+                return p
+            if train_file_dir:
+                return os.path.join(train_file_dir, p)
+            return p
+
+        def _downsample_img(img: "Image.Image", factor: float) -> "Image.Image":
+            try:
+                if factor >= 0.999:
+                    return img
+                w, h = img.size
+                nw = max(1, int(round(w * factor)))
+                nh = max(1, int(round(h * factor)))
+                return img.resize((nw, nh), resample=Image.BILINEAR)
+            except Exception:
+                return img
+
+        def _load_pil_image(path: str, factor: float) -> Optional["Image.Image"]:
+            if Image is None:
+                return None
+            try:
+                img = Image.open(_resolve_img_path(path)).convert("RGB")
+                return _downsample_img(img, factor=factor)
+            except Exception:
+                return None
+
         def build_mask_for_single_sequence(
             input_id_row: torch.Tensor,
             assistant_prefix_ids,
@@ -1315,7 +1357,55 @@ class QwenVLBCTrainer(BCTrainer):
 
             return target
 
-        def make_labels(input_ids: torch.Tensor, tokenizer, ignore_index: int = -100):
+        def build_mask_for_single_sequence_last_only(
+            input_id_row: torch.Tensor,
+            assistant_prefix_ids,
+            im_end_ids,
+            ignore_index: int = -100,
+        ):
+            """
+            与 build_mask_for_single_sequence 类似，但只保留“最后一个 assistant 段”的 token 作为 label。
+            """
+            target = torch.full_like(input_id_row, ignore_index)
+            ids = input_id_row.tolist()
+            n = len(ids)
+
+            pre = assistant_prefix_ids
+            pre_len = len(pre)
+            end = im_end_ids
+            end_len = len(end)
+
+            def find_subseq(haystack, needle, start_pos):
+                last = len(haystack) - len(needle)
+                for s in range(start_pos, last + 1):
+                    if haystack[s : s + len(needle)] == needle:
+                        return s
+                return None
+
+            # 从右往左找最后一个 assistant 段的前缀位置
+            last_pre_pos = None
+            for s in range(n - pre_len, -1, -1):
+                if ids[s : s + pre_len] == pre:
+                    last_pre_pos = s
+                    break
+            if last_pre_pos is None:
+                return target
+
+            content_start = last_pre_pos + pre_len
+            end_pos = find_subseq(ids, end, content_start)
+            if end_pos is None:
+                return target
+
+            if content_start < end_pos:
+                target[content_start:end_pos] = input_id_row[content_start:end_pos]
+            return target
+
+        def make_labels(
+            input_ids: torch.Tensor,
+            tokenizer,
+            ignore_index: int = -100,
+            last_only: bool = False,
+        ):
             """
             根据 input_ids 生成 labels，Mask 掉 user/system 部分，只保留 assistant 段落：
             即形如 <|im_start|>assistant\\n ... <|im_end|> 中间的 token。
@@ -1333,12 +1423,20 @@ class QwenVLBCTrainer(BCTrainer):
             labels = torch.full_like(input_ids, ignore_index)
 
             for i in range(batch_size):
-                labels[i] = build_mask_for_single_sequence(
-                    input_ids[i],
-                    assistant_prefix_ids=assistant_prefix_ids,
-                    im_end_ids=im_end_ids,
-                    ignore_index=ignore_index,
-                )
+                if last_only:
+                    labels[i] = build_mask_for_single_sequence_last_only(
+                        input_ids[i],
+                        assistant_prefix_ids=assistant_prefix_ids,
+                        im_end_ids=im_end_ids,
+                        ignore_index=ignore_index,
+                    )
+                else:
+                    labels[i] = build_mask_for_single_sequence(
+                        input_ids[i],
+                        assistant_prefix_ids=assistant_prefix_ids,
+                        im_end_ids=im_end_ids,
+                        ignore_index=ignore_index,
+                    )
 
             return labels
 
@@ -1361,7 +1459,21 @@ class QwenVLBCTrainer(BCTrainer):
             proc_messages = []
             images_for_conv = []
 
-            for message in conversations:
+            # Preferred: merged dataset provides `images` as per-round image path arrays.
+            # Fallback: legacy path parses base64 from message["value"].
+            images_by_round = item.get("images", None)
+            has_image_paths = isinstance(images_by_round, list)
+            try:
+                k_round = int(item.get("round_idx") or 0)
+            except Exception:
+                k_round = 0
+            if k_round <= 0 and has_image_paths:
+                try:
+                    k_round = int(len(images_by_round))
+                except Exception:
+                    k_round = 0
+
+            for msg_index, message in enumerate(conversations):
                 raw_val = message["value"]
                 text_val = raw_val
                 screenshot_b64 = None
@@ -1408,21 +1520,52 @@ class QwenVLBCTrainer(BCTrainer):
 
                 content_parts = []
 
-                # 如果存在截图，则解码为 PIL.Image 并作为 image 内容传入
-                img = None
-                if screenshot_b64 and Image is not None:
-                    try:
-                        b64_str = str(screenshot_b64)
-                        if "," in b64_str and b64_str.strip().startswith("data:"):
-                            b64_str = b64_str.split(",", 1)[-1]
-                        img_bytes = base64.b64decode(b64_str)
-                        img = Image.open(BytesIO(img_bytes)).convert("RGB")
-                        content_parts.append({"type": "image", "image": img})
-                    except Exception:
-                        # 图像解码失败时，退化为纯文本
-                        img = None
-                if img is not None:
-                    images_for_conv.append(img)
+                # Attach images:
+                # - current round (k): full resolution
+                # - previous `prev_image_rounds`: downsampled
+                # - earlier: no images
+                # If the merged dataset provides image paths, use them; otherwise fallback to base64.
+                if has_image_paths and k_round > 0:
+                    round_r = (msg_index // 2) + 1  # 1-based round index
+                    msg_in_round = msg_index % 2    # 0 for first msg in round, 1 for second
+                    if round_r == k_round:
+                        factor = 1.0
+                    elif (k_round - prev_image_rounds) <= round_r < k_round:
+                        factor = prev_downsample
+                    else:
+                        factor = 0.0
+
+                    if factor > 0:
+                        try:
+                            round_paths = images_by_round[round_r - 1] if (round_r - 1) < len(images_by_round) else []
+                        except Exception:
+                            round_paths = []
+                        if isinstance(round_paths, list) and round_paths:
+                            # Prefer per-message file naming "...msg0/..msg1..." when available
+                            tag = f"msg{msg_in_round}"
+                            matched = [p for p in round_paths if isinstance(p, str) and tag in os.path.basename(p)]
+                            use_paths = matched if matched else [p for p in round_paths if isinstance(p, str)]
+                            for p in use_paths:
+                                img = _load_pil_image(p, factor=factor)
+                                if img is None:
+                                    continue
+                                content_parts.append({"type": "image", "image": img})
+                                images_for_conv.append(img)
+                else:
+                    # Legacy base64 path: if screenshot exists, decode and attach.
+                    img = None
+                    if screenshot_b64 and Image is not None:
+                        try:
+                            b64_str = str(screenshot_b64)
+                            if "," in b64_str and b64_str.strip().startswith("data:"):
+                                b64_str = b64_str.split(",", 1)[-1]
+                            img_bytes = base64.b64decode(b64_str)
+                            img = Image.open(BytesIO(img_bytes)).convert("RGB")
+                            content_parts.append({"type": "image", "image": img})
+                        except Exception:
+                            img = None
+                    if img is not None:
+                        images_for_conv.append(img)
 
                 if text_val:
                     content_parts.append({"type": "text", "text": str(text_val)})
@@ -1551,10 +1694,12 @@ class QwenVLBCTrainer(BCTrainer):
             else:
                 # 基于 ChatML token 序列，只对 assistant 段落计算 loss
                 tok_for_labels = getattr(processor, "tokenizer", processor)
+                last_only = bool(args.get("assistant_last_round_only_loss", False))
                 labels = make_labels(
                     input_ids=input_ids,
                     tokenizer=tok_for_labels,
                     ignore_index=-100,
+                    last_only=last_only,
                 )
 
             forward_kwargs = {
