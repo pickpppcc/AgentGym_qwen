@@ -6,6 +6,13 @@ import os
 
 import torch
 import transformers
+import warnings
+warnings.filterwarnings(
+    "error",
+    message=r".*None of the inputs have requires_grad=True.*",
+    category=UserWarning,
+)
+
 from agentenv.controller import Agent, ChatMLTemplate
 from agentenv.envs import (
     AlfWorldTask,
@@ -135,6 +142,12 @@ class TrainingArguments:
         },
     )
 
+    assistant_last_round_only_loss: bool = field(
+        default=False,
+        metadata={
+            "help": "If True (and assistant_only_loss=True), only supervise the last assistant segment (final round) in Qwen-VL trainer."
+        },
+    )
     # 调试参数：在多模态 collate_fn 中控制单样本 token 数，避免 OOM
     debug: bool = field(
         default=False,
