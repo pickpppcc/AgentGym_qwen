@@ -6,12 +6,12 @@ import os
 
 import torch
 import transformers
-import warnings
-warnings.filterwarnings(
-    "error",
-    message=r".*None of the inputs have requires_grad=True.*",
-    category=UserWarning,
-)
+# import warnings
+# warnings.filterwarnings(
+#     "error",
+#     message=r".*None of the inputs have requires_grad=True.*",
+#     category=UserWarning,
+# )
 
 from agentenv.controller import Agent, ChatMLTemplate
 from agentenv.envs import (

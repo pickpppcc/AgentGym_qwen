@@ -1528,16 +1528,28 @@ class QwenVLBCTrainer(BCTrainer):
                 if has_image_paths and k_round > 0:
                     round_r = (msg_index // 2) + 1  # 1-based round index
                     msg_in_round = msg_index % 2    # 0 for first msg in round, 1 for second
-                    if round_r == k_round:
-                        factor = 1.0
-                    elif (k_round - prev_image_rounds) <= round_r < k_round:
-                        factor = prev_downsample
-                    else:
+                    # Only attach images to the user message (msg0) to keep
+                    # image tokens/features aligned with the chat template.
+                    # Attaching images on assistant turns often duplicates msg0
+                    # via the fallback path and can cause token/feature mismatch.
+                    if msg_in_round != 0:
+                        round_r = None  # mark as no-image
                         factor = 0.0
+                    else:
+                        if round_r == k_round:
+                            factor = 1.0
+                        elif (k_round - prev_image_rounds) <= round_r < k_round:
+                            factor = prev_downsample
+                        else:
+                            factor = 0.0
 
                     if factor > 0:
                         try:
-                            round_paths = images_by_round[round_r - 1] if (round_r - 1) < len(images_by_round) else []
+                            round_paths = (
+                                images_by_round[round_r - 1]
+                                if (round_r is not None and (round_r - 1) < len(images_by_round))
+                                else []
+                            )
                         except Exception:
                             round_paths = []
                         if isinstance(round_paths, list) and round_paths:
@@ -1545,12 +1557,14 @@ class QwenVLBCTrainer(BCTrainer):
                             tag = f"msg{msg_in_round}"
                             matched = [p for p in round_paths if isinstance(p, str) and tag in os.path.basename(p)]
                             use_paths = matched if matched else [p for p in round_paths if isinstance(p, str)]
-                            for p in use_paths:
+                            # Use at most one image per round to avoid exploding image count
+                            # and mismatching the number of <|image_pad|> tokens.
+                            if use_paths:
+                                p = use_paths[0]
                                 img = _load_pil_image(p, factor=factor)
-                                if img is None:
-                                    continue
-                                content_parts.append({"type": "image", "image": img})
-                                images_for_conv.append(img)
+                                if img is not None:
+                                    content_parts.append({"type": "image", "image": img})
+                                    images_for_conv.append(img)
                 else:
                     # Legacy base64 path: if screenshot exists, decode and attach.
                     img = None
@@ -1622,6 +1636,16 @@ class QwenVLBCTrainer(BCTrainer):
 
                 texts.append(text)
                 images_batch.append(images_for_conv if images_for_conv else [])
+
+                # Defensive alignment: some chat templates may not expand image parts 1:1 into
+                # <|image_pad|> tokens. If they don't match, trim extra images so processor
+                # won't raise "Image features and image tokens do not match".
+                try:
+                    pad_cnt = int(text.count("<|image_pad|>")) if isinstance(text, str) else 0
+                    if pad_cnt >= 0 and len(images_batch[-1]) > pad_cnt:
+                        images_batch[-1] = images_batch[-1][:pad_cnt]
+                except Exception:
+                    pass
 
             # 至少有一个样本带图像时，传入 images 参数；否则仅按纯文本处理
             if any(len(imgs) > 0 for imgs in images_batch):
