@@ -9,14 +9,14 @@ set -euo pipefail
 #   GPUS=5 bash AgentGym2/AgentGym/agentenv/train_behavioral_clone_multi_task_qwen3vl.sh
 #   GPUS=0,1 bash AgentGym2/AgentGym/agentenv/train_behavioral_clone_multi_task_qwen3vl.sh
 
-ROOT_DIR="/data/pengchen/OSWorld/Osworld/AgentGym2/AgentGym/agentenv"
+ROOT_DIR="/dfs/data/AgentGym_qwen/agentenv"
 cd "${ROOT_DIR}"
 
 # ---- Environment (match launch.json) ----
-export PATH="/home/pengchen/miniconda3/envs/osworld/bin:${PATH}"
-export PYTHONPATH="/data/pengchen/OSWorld/Osworld/AgentGym2/AgentGym/agentenv:${PYTHONPATH:-}"
+# export PATH="/home/pengchen/miniconda3/envs/osworld/bin:${PATH}"
+# export PYTHONPATH="/data/pengchen/OSWorld/Osworld/AgentGym2/AgentGym/agentenv:${PYTHONPATH:-}"
 
-export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+# export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 export DEEPSPEED_COMM_AUTO_MPI_DISCOVERY="${DEEPSPEED_COMM_AUTO_MPI_DISCOVERY:-0}"
 export DS_BUILD_OPS="${DS_BUILD_OPS:-0}"
 export DS_BUILD_SPARSE_ATTN="${DS_BUILD_SPARSE_ATTN:-0}"
@@ -28,7 +28,7 @@ export NCCL_IB_DISABLE="${NCCL_IB_DISABLE:-1}"
 export CUDA_DEVICE_MAX_CONNECTIONS="${CUDA_DEVICE_MAX_CONNECTIONS:-1}"
 
 # GPUs: can pass GPUS="5" or "0,1". Defaults to 5 to match your launch.json.
-GPUS="${GPUS:-5}"
+GPUS="${GPUS:-0}"
 CUDA_VISIBLE_DEVICES_VAL="$(echo "${GPUS}" | tr ' ' ',' | tr -d '\n' )"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES_VAL}"
 
@@ -39,14 +39,14 @@ NUM_GPUS="${NUM_GPUS:-$#}"
 main_process_port="${MAIN_PROCESS_PORT:-8897}"
 
 # ---- Args (match launch.json) ----
-train_file="/data/pengchen/OSWorld/Osworld/AgentGym2/AgentGym/data/processed_conversations_vl_train.json"
-inference_file="/data/pengchen/OSWorld/Osworld/AgentGym2/AgentGym/data/processed_conversations_vl_validation.json"
-test_file="/data/pengchen/OSWorld/Osworld/AgentGym2/AgentGym/data/processed_conversations_vl_test.json"
+train_file="/dfs/data/AgentGym_qwen/data/processed_conversations_vl_train.json"
+inference_file="/dfs/data/AgentGym_qwen/data/processed_conversations_vl_validation.json"
+test_file="/dfs/data/AgentGym_qwen/data/processed_conversations_vl_test.json"
 
-model_train_path="/data/pengchen/OSWorld/Osworld/models/Qwen/Qwen3-VL-4B-Instruct"
-model_save_path="/data/pengchen/OSWorld/Osworld/AgentGym2/AgentGym/agentenv/outputs/behavioral_clone_osworld_smoke"
+model_train_path="/dfs/data/models/Qwen3-VL-4B-Instruct"
+model_save_path="/dfs/data/AgentGym_qwen/agentenv/outputs"
 
-env_server_base="http://127.0.0.1:36001"
+env_server_base="http://10.110.146.172:36002"
 examples_dir="/data/pengchen/OSWorld/Osworld/OSWorld/evaluation_examples/examples/chrome"
 save_dir="/data/pengchen/OSWorld/Osworld/OSWorld/results/pyautogui/screenshot/ui-tars/agentgym/chrome"
 
@@ -63,7 +63,7 @@ accelerate launch \
   --model_train_path "${model_train_path}" \
   --model_save_path "${model_save_path}" \
   --task_name "osworld" \
-  --batch_size "4" \
+  --batch_size "2" \
   --eval_batch_size "1" \
   --n_epochs "2000" \
   --num_workers "0" \

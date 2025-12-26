@@ -12,7 +12,7 @@ import requests
 from agentenv.controller import BaseEnvClient, BaseTask
 from agentenv.controller.types import ConversationMessage, StepOutput
 import sys
-sys.path.append('/data/pengchen/OSWorld/Osworld/OSWorld')
+sys.path.append('/dfs/data/OSWorld')
 from mm_agents.uitars15_v1 import (
     parse_action,
     UITARS_ACTION_SPACE,
