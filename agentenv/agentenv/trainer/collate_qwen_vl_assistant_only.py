@@ -133,10 +133,7 @@ def _encode_single_sample_assistant_only(
         labels = [-100]
         attention_mask = [1]
 
-    # 截断到 max_input_length
-    input_ids = input_ids[:max_input_length]
-    labels = labels[:max_input_length]
-    attention_mask = attention_mask[:max_input_length]
+    # No truncation: keep the full token sequence as-is.
 
     pixel_values = None
     image_grid_thw = None
@@ -238,5 +235,4 @@ def collate_qwen_vl_assistant_only(
             pass
 
     return {"forward_kwargs": forward_kwargs}
-
 

@@ -173,12 +173,8 @@ class AgentEvolTrainer(BaseTrainer):
 
                 attention_mask = [1] * len(input_ids)
 
-                # Truncation
+                # No truncation here: keep the full conversation tokens as-is.
                 input_ids_max_length = len(input_ids)
-                # assert input_ids_max_length <= args['max_input_length'], input_ids_max_length
-                input_ids = input_ids[: args["max_input_length"]]
-                labels = labels[: args["max_input_length"]]
-                attention_mask = attention_mask[: args["max_input_length"]]
 
                 ##
                 new_batch["input_ids"].append(input_ids)
@@ -534,7 +530,8 @@ class AgentEvolTrainer(BaseTrainer):
             with torch.no_grad():
                 exps = self.eval(
                     generation_config=GenerationConfig(
-                        max_length=4096,
+                        # Explicit generation budget to avoid Transformers' small default max_length.
+                        max_new_tokens=2048,
                         do_sample=False,
                         eos_token_id=self.agent.tokenizer.eos_token_id,
                         pad_token_id=(
@@ -594,7 +591,8 @@ class AgentEvolTrainer(BaseTrainer):
             with torch.no_grad():
                 exps = self.eval(
                     generation_config=GenerationConfig(
-                        max_length=4096,
+                        # Explicit generation budget to avoid Transformers' small default max_length.
+                        max_new_tokens=2048,
                         do_sample=True,
                         temperature=1.2,
                         eos_token_id=self.agent.tokenizer.eos_token_id,

@@ -328,7 +328,8 @@ class SetupController:
             stdout: str = "",
             stderr: str = "",
             shell: bool = False,
-            until: Optional[Dict[str, Any]] = None
+            until: Optional[Dict[str, Any]] = None,
+            timeout: Optional[float] = None,
     ):
         if not command:
             raise Exception("Empty command to launch.")
@@ -362,7 +363,20 @@ class SetupController:
                     new_command_list.append(item)
                 return new_command_list
         command = replace_screen_env_in_command(command)
-        payload = json.dumps({"command": command, "shell": shell})
+
+        if timeout is None:
+            try:
+                cmd_list = command if isinstance(command, list) else [str(command)]
+                is_libreoffice_convert = (
+                    len(cmd_list) > 0
+                    and str(cmd_list[0]) in {"libreoffice", "soffice"}
+                    and any(str(x) == "--convert-to" for x in cmd_list)
+                )
+                timeout = 600.0 if is_libreoffice_convert else 120.0
+            except Exception:
+                timeout = 120.0
+
+        payload = json.dumps({"command": command, "shell": shell, "timeout": float(timeout)})
         headers = {"Content-Type": "application/json"}
 
         while not terminates:
@@ -407,7 +421,8 @@ class SetupController:
             verification: Dict[str, Any] = None,
             max_wait_time: int = 10,
             check_interval: float = 1.0,
-            shell: bool = False
+            shell: bool = False,
+            timeout: Optional[float] = None,
     ):
         """Execute command with verification of results
         
@@ -425,12 +440,24 @@ class SetupController:
 
         verification = verification or {}
         
+        if timeout is None:
+            try:
+                is_libreoffice_convert = (
+                    len(command) > 0
+                    and str(command[0]) in {"libreoffice", "soffice"}
+                    and any(str(x) == "--convert-to" for x in command)
+                )
+                timeout = 600.0 if is_libreoffice_convert else 120.0
+            except Exception:
+                timeout = 120.0
+
         payload = json.dumps({
             "command": command, 
             "shell": shell,
             "verification": verification,
             "max_wait_time": max_wait_time,
-            "check_interval": check_interval
+            "check_interval": check_interval,
+            "timeout": float(timeout),
         })
         headers = {"Content-Type": "application/json"}
 

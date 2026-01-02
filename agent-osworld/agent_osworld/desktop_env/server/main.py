@@ -80,6 +80,7 @@ def execute_command():
     # The 'command' key in the JSON request should contain the command to be executed.
     shell = data.get('shell', False)
     command = data.get('command', "" if shell else [])
+    timeout = data.get("timeout", 120)
 
     if isinstance(command, str) and not shell:
         command = shlex.split(command)
@@ -101,7 +102,7 @@ def execute_command():
             stderr=subprocess.PIPE,
             shell=shell,
             text=True,
-            timeout=120,
+            timeout=timeout,
             creationflags=flags,
         )
         return jsonify({
@@ -127,6 +128,7 @@ def execute_command_with_verification():
     verification = data.get('verification', {})
     max_wait_time = data.get('max_wait_time', 10)  # Maximum wait time in seconds
     check_interval = data.get('check_interval', 1)  # Check interval in seconds
+    timeout = data.get("timeout", 120)
 
     if isinstance(command, str) and not shell:
         command = shlex.split(command)
@@ -148,7 +150,7 @@ def execute_command_with_verification():
             stderr=subprocess.PIPE,
             shell=shell,
             text=True,
-            timeout=120,
+            timeout=timeout,
             creationflags=flags,
         )
         

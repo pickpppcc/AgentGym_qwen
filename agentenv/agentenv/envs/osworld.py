@@ -6,6 +6,7 @@ import os
 import time
 import json
 import base64
+import struct
 
 import requests
 
@@ -37,6 +38,13 @@ class OSWorldEnvClient(BaseEnvClient):
         self._current_task_id: str | None = None
         self._step_index: int = 0
         self._recording_active: bool = False
+        # UI-TARS models often emit normalized coordinates in [0, 1000] (not raw pixels).
+        # Scale them back to the current screenshot resolution before sending to OSWorld server.
+        try:
+            self._uitars_coord_factor: int = int(os.environ.get("AGENTGYM_UITARS_COORD_FACTOR", "1000"))
+        except Exception:
+            self._uitars_coord_factor = 1000
+        self._last_screen_size: tuple[int, int] | None = None
 
         # 创建 OSWorld 环境实例；若后端返回 500 等错误，尽量把服务端返回的报错信息打出来，方便排查。
         try:
@@ -264,6 +272,44 @@ class OSWorldEnvClient(BaseEnvClient):
         if isinstance(act, str):
             act = act.strip()
 
+        def _maybe_refresh_screen_size() -> None:
+            # Best-effort: infer current screen size from last observation screenshot_base64.
+            # Falls back to (1920,1080) if anything fails.
+            try:
+                if not isinstance(self.info, dict):
+                    return
+                obs = self.info.get("observation")
+                if not isinstance(obs, dict):
+                    return
+                b64 = obs.get("screenshot_base64")
+                if not isinstance(b64, str) or not b64:
+                    return
+                b64_str = b64
+                if "," in b64_str and b64_str.strip().startswith("data:"):
+                    b64_str = b64_str.split(",", 1)[-1]
+                img_bytes = base64.b64decode(b64_str)
+                # PNG IHDR: width/height stored at bytes 16..24 (big-endian)
+                if len(img_bytes) >= 24 and img_bytes[:8] == b"\x89PNG\r\n\x1a\n":
+                    w = int(struct.unpack(">I", img_bytes[16:20])[0])
+                    h = int(struct.unpack(">I", img_bytes[20:24])[0])
+                    if w > 0 and h > 0:
+                        self._last_screen_size = (w, h)
+            except Exception:
+                return
+
+        def _scale_point(x: float, y: float) -> tuple[float, float]:
+            factor = int(self._uitars_coord_factor or 0)
+            if factor <= 0:
+                return x, y
+            # Heuristic: if coords are within [0,factor], treat as normalized and scale to screen.
+            if not (0.0 <= float(x) <= float(factor) and 0.0 <= float(y) <= float(factor)):
+                return x, y
+            w, h = self._last_screen_size or (1920, 1080)
+            try:
+                return float(x) / float(factor) * float(w), float(y) / float(factor) * float(h)
+            except Exception:
+                return x, y
+
         def _parse_point(s: str) -> tuple[float, float] | None:
             try:
                 inner = s.strip().strip("'").strip('"').strip()
@@ -274,7 +320,9 @@ class OSWorldEnvClient(BaseEnvClient):
                 )
                 if inner.startswith("(") and inner.endswith(")"):
                     x_str, y_str = inner[1:-1].split(",")
-                    return float(x_str.strip()), float(y_str.strip())
+                    _maybe_refresh_screen_size()
+                    x0, y0 = float(x_str.strip()), float(y_str.strip())
+                    return _scale_point(x0, y0)
                 return None
             except Exception:
                 return None
@@ -385,8 +433,14 @@ class OSWorldEnvClient(BaseEnvClient):
                 self._save_observation_snapshot(resp.get("observation"), out_path)
         except Exception:
             pass
+
+        # IMPORTANT: Keep per-step observation formatting consistent with `observe()`.
+        # - For `observe_format="screenshot_base64"`, this ensures the VLM continues to receive screenshots
+        #   after the initial reset (otherwise it would only get a text summary).
+        # - For `observe_format="text"` / "raw", this matches the user's chosen mode.
+        next_state = self.observe()
         return StepOutput(
-            state=self._format_observation(resp["observation"]),
+            state=next_state,
             reward=float(resp["reward"]),
             done=bool(resp["done"]),
         )

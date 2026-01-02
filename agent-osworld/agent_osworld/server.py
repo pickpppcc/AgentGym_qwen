@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import math
 import threading
 from typing import Any, Dict, Optional
 
@@ -45,6 +46,8 @@ class CreateRequestBody(BaseModel):
     require_a11y_tree: Optional[bool] = None
     require_terminal: Optional[bool] = None
     os_type: Optional[str] = None
+    client_password: Optional[str] = None
+    auto_unlock: Optional[bool] = None
     # AgentGym-specific: automatically call OSWorld DesktopEnv.evaluate() after each step
     # and mark done when score reaches the threshold.
     auto_evaluate: Optional[bool] = None
@@ -94,7 +97,10 @@ class OSWorldServer:
         cfg = cfg or {}
         env_id = self._next_id()
 
-        # 使用 OSWorld DesktopEnv 默认参数，允许通过 cfg 覆盖
+        # 使用 OSWorld DesktopEnv 默认参数，允许通过 cfg 覆盖。
+        # NOTE: 不要在 /create 阶段做 env.reset() 这类“启动模拟器/回滚快照”的重操作：
+        # - 会让 /create 阻塞很久，客户端（AgentGym）在初始化时容易 ReadTimeout；
+        # - 真正需要启动环境的是后续的 /reset(task_config=...)（BaseTask 会先 reset 再 observe）。
         env = DesktopEnv(
             provider_name=(cfg.get("provider_name") or "docker"),
             region=cfg.get("region"),
@@ -107,15 +113,21 @@ class OSWorldServer:
             require_a11y_tree=True if cfg.get("require_a11y_tree") is None else bool(cfg.get("require_a11y_tree")),
             require_terminal=False if cfg.get("require_terminal") is None else bool(cfg.get("require_terminal")),
             os_type=(cfg.get("os_type") or "Ubuntu"),
+            client_password=(cfg.get("client_password") or ""),
+            auto_unlock=True if cfg.get("auto_unlock") is None else bool(cfg.get("auto_unlock")),
         )
-        # 调用 reset 以在 docker/provider 下启动模拟器（controller 等在此初始化）
-        ob = env.reset(task_config=None)
+        # Some OSWorld evaluators (e.g., Chrome getters) expect these proxy flags to exist on env.
+        # AgentGym's server path doesn't manage proxy, so default them to False to avoid AttributeError.
+        if not hasattr(env, "current_use_proxy"):
+            setattr(env, "current_use_proxy", False)
+        if not hasattr(env, "enable_proxy"):
+            setattr(env, "enable_proxy", False)
         self.env[env_id] = env
         self.ls.append(env_id)
         self._auto_evaluate[env_id] = bool(cfg.get("auto_evaluate")) if cfg.get("auto_evaluate") is not None else False
         self._done_score_threshold[env_id] = float(cfg.get("done_score_threshold")) if cfg.get("done_score_threshold") is not None else 1.0
         self.info[env_id] = {
-            "observation": _sanitize_observation(ob),
+            "observation": {},
             "reward": 0.0,
             "done": False,
         }
@@ -128,28 +140,81 @@ class OSWorldServer:
         ob_json = _sanitize_observation(ob)
         score = None
         eval_error: Optional[str] = None
-        if self._auto_evaluate.get(env_id, False) and hasattr(env, "evaluator"):
+        auto_eval = bool(self._auto_evaluate.get(env_id, False))
+        already_scored = isinstance(info, dict) and ("score" in info)
+        if already_scored:
             try:
-                raw = env.evaluate()
-                score = float(env.evaluate())
-                reward = score
-                threshold = float(self._done_score_threshold.get(env_id, 1.0))
-                if score >= threshold:
-                    done = True
-            except Exception as e:
-                eval_error = str(e)
+                score = float(info.get("score"))  # type: ignore[call-arg]
+            except Exception:
+                score = None
+
+        if auto_eval and not already_scored:
+            if hasattr(env, "evaluator"):
+                # If the evaluator has postconfig steps, evaluating on every step can be extremely
+                # expensive (e.g., LibreOffice exports) and may even fail due to timeouts/locks.
+                # In that case, only evaluate when the episode is already terminal.
+                try:
+                    needs_postconfig = bool(getattr(env, "evaluator", {}).get("postconfig"))
+                except Exception:
+                    needs_postconfig = False
+                if needs_postconfig and not done:
+                    # Skip mid-episode evaluation; keep reward/done as returned by env.step().
+                    pass
+                else:
+                    # Some evaluators (e.g., Chrome getters) expect these proxy flags to exist on env.
+                    # AgentGym's server path doesn't manage proxy, so default them to False.
+                    if not hasattr(env, "current_use_proxy"):
+                        setattr(env, "current_use_proxy", False)
+                    if not hasattr(env, "enable_proxy"):
+                        setattr(env, "enable_proxy", False)
+                    try:
+                        raw = env.evaluate()
+                        score = float(raw)
+                        if not math.isfinite(score):
+                            raise ValueError(f"Non-finite evaluation score: {raw!r}")
+                        reward = score
+                        threshold = float(self._done_score_threshold.get(env_id, 1.0))
+                        if score >= threshold:
+                            done = True
+                    except Exception as e:
+                        eval_error = f"{type(e).__name__}: {e}"
+                        logger.exception("AUTO_EVAL_FAILED id=%s", env_id)
+                        # Make eval failure impossible to miss downstream: return a sentinel reward and stop this episode.
+                        reward = -1.0
+                        done = True
+                        try:
+                            info = dict(info) if isinstance(info, dict) else {"info": info}
+                            info["eval_error"] = eval_error
+                        except Exception:
+                            pass
+            else:
+                eval_error = "auto_evaluate is enabled but env.evaluator is not set; did you /reset with task_config?"
+                logger.error("AUTO_EVAL_FAILED id=%s reason=%s", env_id, eval_error)
+                reward = -1.0
+                done = True
                 try:
                     info = dict(info) if isinstance(info, dict) else {"info": info}
-                    info["eval_error"] = str(e)
+                    info["eval_error"] = eval_error
                 except Exception:
                     pass
-        elif self._auto_evaluate.get(env_id, False) and not hasattr(env, "evaluator"):
-            eval_error = "auto_evaluate is enabled but env.evaluator is not set; did you /reset with task_config?"
+        elif auto_eval and already_scored:
+            # The underlying OSWorld env already evaluated on terminal actions (DONE/FAIL) and
+            # attached the score in info; just propagate it and apply threshold logic.
+            try:
+                if score is not None and math.isfinite(float(score)):
+                    reward = float(score)
+                    threshold = float(self._done_score_threshold.get(env_id, 1.0))
+                    if float(score) >= threshold:
+                        done = True
+            except Exception:
+                pass
         payload = {
             "observation": ob_json,
             "reward": float(reward),
             "done": bool(done),
         }
+        if auto_eval:
+            payload["eval_ok"] = bool(eval_error is None)
         if score is not None:
             payload["score"] = float(score)
             payload["success"] = bool(payload["done"])
@@ -172,6 +237,11 @@ class OSWorldServer:
 
     def reset(self, env_id: int, task_config: Optional[Dict[str, Any]], seed: Optional[int]) -> Dict[str, Any]:
         env = self.env[env_id]
+        # Ensure proxy flags exist before any evaluation.
+        if not hasattr(env, "current_use_proxy"):
+            setattr(env, "current_use_proxy", False)
+        if not hasattr(env, "enable_proxy"):
+            setattr(env, "enable_proxy", False)
         ob = env.reset(task_config=task_config, seed=seed)
         ob_json = _sanitize_observation(ob)
         payload: Dict[str, Any] = {
@@ -179,16 +249,43 @@ class OSWorldServer:
             "reward": 0.0,
             "done": False,
         }
-        if self._auto_evaluate.get(env_id, False) and hasattr(env, "evaluator"):
-            try:
-                score = float(env.evaluate())
-                payload["reward"] = float(score)
-                threshold = float(self._done_score_threshold.get(env_id, 1.0))
-                payload["done"] = bool(score >= threshold)
-                payload["score"] = float(score)
-                payload["success"] = bool(payload["done"])
-            except Exception:
-                pass
+        auto_eval = bool(self._auto_evaluate.get(env_id, False))
+        if auto_eval:
+            if hasattr(env, "evaluator"):
+                try:
+                    needs_postconfig = bool(getattr(env, "evaluator", {}).get("postconfig"))
+                    if needs_postconfig:
+                        # Avoid running heavy postconfig immediately on reset.
+                        payload["eval_ok"] = True
+                        self.info[env_id] = payload
+                        try:
+                            obs_keys = list(ob_json.keys()) if isinstance(ob_json, dict) else []
+                            logger.info("RESET id=%s obs_keys=%s", env_id, obs_keys)
+                        except Exception:
+                            pass
+                        return payload
+                    raw = env.evaluate()
+                    score = float(raw)
+                    if not math.isfinite(score):
+                        raise ValueError(f"Non-finite evaluation score: {raw!r}")
+                    payload["reward"] = float(score)
+                    threshold = float(self._done_score_threshold.get(env_id, 1.0))
+                    payload["done"] = bool(score >= threshold)
+                    payload["score"] = float(score)
+                    payload["success"] = bool(payload["done"])
+                    payload["eval_ok"] = True
+                except Exception as e:
+                    eval_error = f"{type(e).__name__}: {e}"
+                    logger.exception("AUTO_EVAL_FAILED_ON_RESET id=%s", env_id)
+                    payload["reward"] = -1.0
+                    payload["eval_ok"] = False
+                    payload["eval_error"] = eval_error
+            else:
+                eval_error = "auto_evaluate is enabled but env.evaluator is not set; did you /reset with task_config?"
+                logger.error("AUTO_EVAL_FAILED_ON_RESET id=%s reason=%s", env_id, eval_error)
+                payload["reward"] = -1.0
+                payload["eval_ok"] = False
+                payload["eval_error"] = eval_error
         self.info[env_id] = payload
         try:
             obs_keys = list(ob_json.keys()) if isinstance(ob_json, dict) else []
@@ -198,8 +295,10 @@ class OSWorldServer:
         return payload
 
     def observation(self, env_id: int) -> Dict[str, Any]:
-        # 实时从 Env 获取
+        # 实时从 Env 获取；如果还没 reset 启动 emulator/controller，则返回空 observation。
         env = self.env[env_id]
+        if not hasattr(env, "controller"):
+            return {"observation": {}}
         ob = env._get_obs()  # noqa: SLF001 保持与 OSWorld 一致
         return {"observation": _sanitize_observation(ob)}
 

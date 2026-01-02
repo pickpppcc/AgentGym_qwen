@@ -157,7 +157,47 @@ class DesktopEnv(gym.Env):
             self._set_task_info(task_config)
             self.setup_controller.reset_cache_dir(self.cache_dir)
             logger.info("Setting up environment...")
-            self.setup_controller.setup(self.config)
+            # Prevent black-screen/lock during long rollouts (common in headless + VNC).
+            # Run best-effort commands; failures are ignored by forcing exit 0.
+            disable_lock_config = [
+                {
+                    "type": "execute",
+                    "parameters": {
+                        "command": [
+                            "bash",
+                            "-lc",
+                            "\n".join(
+                                [
+                                    "set +e",
+                                    'export DISPLAY="${DISPLAY:-:0}"',
+                                    'export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"',
+                                    "",
+                                    "if command -v xset >/dev/null 2>&1; then",
+                                    "  xset s off || true",
+                                    "  xset s noblank || true",
+                                    "  xset -dpms || true",
+                                    "fi",
+                                    "",
+                                    "if command -v gsettings >/dev/null 2>&1; then",
+                                    "  gsettings set org.gnome.desktop.session idle-delay 0 || true",
+                                    "  gsettings set org.gnome.desktop.screensaver lock-enabled false || true",
+                                    "  gsettings set org.gnome.desktop.screensaver idle-activation-enabled false || true",
+                                    "  gsettings set org.gnome.settings-daemon.plugins.power sleep-inactive-ac-type 'nothing' || true",
+                                    "  gsettings set org.gnome.settings-daemon.plugins.power sleep-inactive-battery-type 'nothing' || true",
+                                    "fi",
+                                    "",
+                                    "pkill -x xscreensaver >/dev/null 2>&1 || true",
+                                    "pkill -x gnome-screensaver >/dev/null 2>&1 || true",
+                                    "pkill -x light-locker >/dev/null 2>&1 || true",
+                                    "exit 0",
+                                ]
+                            ),
+                        ],
+                        "timeout": 30.0,
+                    },
+                }
+            ]
+            self.setup_controller.setup(disable_lock_config + (self.config or []))
             logger.info("Environment setup complete.")
 
         observation = self._get_obs()

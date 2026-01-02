@@ -1,5 +1,6 @@
 import os
 import logging
+import time
 from typing import Dict, List, Set
 from typing import Optional, Any, Union
 from datetime import datetime
@@ -49,24 +50,66 @@ def get_cloud_file(env, config: Dict[str, Any]) -> Union[str, List[str]]:
     cache_paths: List[str] = []
 
     gives: Set[int] = set(config.get("gives", [0]))
+    timeout_s: float = float(config.get("timeout", 60.0))
+    retries: int = int(config.get("retries", 3))
+    retry_sleep_s: float = float(config.get("retry_sleep", 1.0))
+    hf_mirror: str = str(
+        config.get("hf_mirror")
+        or os.getenv("OSWORLD_HF_MIRROR")
+        or os.getenv("HF_MIRROR")
+        or ""
+    ).strip().rstrip("/")
+
+    def _rewrite_hf_url(url: str) -> str:
+        u = (url or "").strip()
+        if not u:
+            return u
+        if not hf_mirror:
+            return u
+        if u.startswith("https://huggingface.co/") or u.startswith("http://huggingface.co/"):
+            return hf_mirror + "/" + u.split("huggingface.co/", 1)[1]
+        return u
+
+    def _download(url: str, out_path: str) -> None:
+        os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+        tmp_path = out_path + ".part"
+        last_err: Optional[Exception] = None
+
+        for attempt in range(max(1, retries)):
+            try:
+                rewritten = _rewrite_hf_url(url)
+                with requests.get(rewritten, stream=True, timeout=timeout_s) as response:
+                    response.raise_for_status()
+                    with open(tmp_path, "wb") as f:
+                        for chunk in response.iter_content(chunk_size=8192):
+                            if chunk:
+                                f.write(chunk)
+                if os.path.exists(tmp_path) and os.path.getsize(tmp_path) > 0:
+                    os.replace(tmp_path, out_path)
+                    return
+                raise IOError(f"Downloaded empty file for {url} -> {out_path}")
+            except Exception as e:
+                last_err = e
+                try:
+                    if os.path.exists(tmp_path):
+                        os.remove(tmp_path)
+                except Exception:
+                    pass
+                if attempt < max(1, retries) - 1:
+                    time.sleep(retry_sleep_s)
+        raise requests.RequestException(f"Failed to download after {retries} attempts: {url}") from last_err
 
     for i, (p, d) in enumerate(zip(paths, dests)):
         _path = os.path.join(env.cache_dir, d)
         if i in gives:
             cache_paths.append(_path)
 
-        if os.path.exists(_path):
+        if os.path.exists(_path) and os.path.getsize(_path) > 0:
             #return _path
             continue
 
         url = p
-        response = requests.get(url, stream=True)
-        response.raise_for_status()
-
-        with open(_path, 'wb') as f:
-            for chunk in response.iter_content(chunk_size=8192):
-                if chunk:
-                    f.write(chunk)
+        _download(url, _path)
 
     return cache_paths[0] if len(cache_paths)==1 else cache_paths
 

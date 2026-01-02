@@ -227,7 +227,8 @@ class DistributedEvaluator(BaseTrainer):
 
                 exps = self.eval(
                     generation_config=GenerationConfig(
-                        max_length=4096,
+                        # Explicit generation budget to avoid Transformers' small default max_length.
+                        max_new_tokens=2048,
                         do_sample=self.args["do_sample"],
                         temperature=self.args["temperature"],
                         eos_token_id=eos_id,
@@ -291,4 +292,3 @@ class DistributedEvaluator(BaseTrainer):
         self.accelerator.print("\n\n==== Inference Evaluation ====\n")
         self.accelerator.print(f"Score: {mean_reward:.5f}")
         self.accelerator.print(f"Success: {mean_success:.5f}")
-

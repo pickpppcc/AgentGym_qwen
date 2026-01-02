@@ -1,6 +1,8 @@
 from typing import Any, Callable, Mapping, Optional, Sequence
 import json
 import re
+import os
+import math
 from io import BytesIO
 import base64
 
@@ -61,11 +63,12 @@ class BaseTask:
                 "- Include exactly one 'Thought:' line and exactly one 'Action:' line.\n"
                 "- The Action line must be a single function call from the provided action space.\n"
                 "- Never output multiple actions, numbered steps, bullet lists, or explanations.\n"
-                "- Coordinates are pixel coordinates on a 1920x1080 desktop (x in [0,1920], y in [0,1080]); use numbers like (960,540).\n"
+                "- Coordinates use UI-TARS normalized space: x,y in [0,1000] over a 1920x1080 desktop; use numbers like (500,500).\n"
                 "- For click/left_double/right_single/drag/scroll: use start_box/end_box as plain '(x,y)' numeric pairs; "
                 "do NOT include '<|box_start|>' tokens.\n"
                 "- For type(content=...): use a single-quoted string; use \\\\n to press Enter; escape quotes if needed.\n"
-                "- If waiting for the UI, output Action: wait(). If finished, output Action: finished().\n"
+                "- If waiting for the UI, output Action: wait().\n"
+                "- Only output Action: finished() when you are confident the user instruction is fully satisfied; if unsure, continue interacting instead.\n"
                 "- If impossible or you need user help, output Action: call_user()."
             )
 
@@ -264,14 +267,52 @@ class BaseTask:
             sys_text, conv_rest = _split_system_from_conversation_start(conv)
             if sys_text is None:
                 sys_text = _uitars_system_prompt()
-            # messages.append(
-            #     {
-            #         "role": "system",
-            #         "content": [{"type": "text", "text": sys_text}],
-            #     }
-            # )
+            # IMPORTANT: Ensure the model always receives the strict UITARS formatting instruction.
+            # Without this, VL models often emit only a Thought line and omit the Action line.
+            messages.append(
+                {
+                    "role": "system",
+                    "content": [{"type": "text", "text": sys_text}],
+                }
+            )
 
-            for msg in conv_rest:
+            # OSWorld-style: keep only the most recent N screenshots to avoid OOM as the episode grows.
+            # Defaults match OSWorld agents (history_n=5).
+            try:
+                max_image_history = int(os.environ.get("AGENTGYM_OSWORLD_HISTORY_N", "5"))
+            except Exception:
+                max_image_history = 5
+            if max_image_history < 0:
+                max_image_history = 0
+
+            # OSWorld-style pixel budget (prevents extremely large frames from exploding visual tokens).
+            try:
+                max_pixels = int(os.environ.get("AGENTGYM_OSWORLD_MAX_PIXELS", str(16384 * 28 * 28)))
+            except Exception:
+                max_pixels = 16384 * 28 * 28
+            try:
+                min_pixels = int(os.environ.get("AGENTGYM_OSWORLD_MIN_PIXELS", str(100 * 28 * 28)))
+            except Exception:
+                min_pixels = 100 * 28 * 28
+
+            # Pre-scan which turns contain screenshots; only decode the last N to save memory/time.
+            screenshot_turn_idxs: list[int] = []
+            if max_image_history > 0:
+                for i, msg in enumerate(conv_rest):
+                    raw_val = msg.get("value")
+                    if isinstance(raw_val, str) and raw_val.strip().startswith("{"):
+                        try:
+                            inner = json.loads(raw_val)
+                            if isinstance(inner, dict) and inner.get("screenshot_base64"):
+                                screenshot_turn_idxs.append(i)
+                        except Exception:
+                            pass
+            if max_image_history > 0:
+                keep_idxs = set(screenshot_turn_idxs[-max_image_history:])
+            else:
+                keep_idxs = set()
+
+            for i, msg in enumerate(conv_rest):
                 role = "user" if msg["from"] == "human" else "assistant"
                 raw_val = msg["value"]
                 text_val = raw_val
@@ -294,7 +335,7 @@ class BaseTask:
 
                 content_parts: list[dict[str, Any]] = []
                 img = None
-                if screenshot_b64 and Image is not None:
+                if screenshot_b64 and Image is not None and (i in keep_idxs):
                     try:
                         b64_str = str(screenshot_b64)
                         # 兼容 data:image/png;base64,xxx 形式
@@ -302,6 +343,26 @@ class BaseTask:
                             b64_str = b64_str.split(",", 1)[-1]
                         img_bytes = base64.b64decode(b64_str)
                         img = Image.open(BytesIO(img_bytes)).convert("RGB")
+
+                        # Resize to keep pixels within [min_pixels, max_pixels] (OSWorld-style).
+                        try:
+                            cur_pixels = int(img.width) * int(img.height)
+                            if max_pixels and cur_pixels > int(max_pixels):
+                                resize_factor = math.sqrt(float(max_pixels) / float(cur_pixels))
+                                w = max(1, int(img.width * resize_factor))
+                                h = max(1, int(img.height * resize_factor))
+                                img = img.resize((w, h))
+                            cur_pixels = int(img.width) * int(img.height)
+                            if min_pixels and cur_pixels < int(min_pixels):
+                                resize_factor = math.sqrt(float(min_pixels) / float(cur_pixels))
+                                w = max(1, int(math.ceil(img.width * resize_factor)))
+                                h = max(1, int(math.ceil(img.height * resize_factor)))
+                                img = img.resize((w, h))
+                            if img.mode != "RGB":
+                                img = img.convert("RGB")
+                        except Exception:
+                            pass
+
                         content_parts.append({"type": "image", "image": img})
                     except Exception:
                         img = None
@@ -341,6 +402,8 @@ class BaseTask:
                             # 回退：简单拼接所有文本片段，保证不为空
                             text_parts: list[str] = []
                             try:
+                                if sys_text:
+                                    text_parts.append(str(sys_text).strip())
                                 for m in messages:
                                     for part in m.get("content", []):
                                         if isinstance(part, dict) and part.get("type") == "text":
@@ -386,9 +449,6 @@ class BaseTask:
                         break  # 发生异常则中止当前 episode，避免影响其它任务
                 else:
                     input_length = len(conversation_tokenized["input_ids"])
-                    # if input_length exceeds max_length, break
-                    if input_length >= (generation_config.max_length or 4096):
-                        break
                     try:
                         generated_tokens = agent.generate(
                             [conversation_tokenized["input_ids"]], generation_config

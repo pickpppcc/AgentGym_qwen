@@ -442,12 +442,8 @@ class BCTrainer(BaseTrainer):
                     labels = [-100]
                     attention_mask = [1]
 
-                # Truncation
+                # No truncation here: keep the full conversation tokens as-is.
                 input_ids_max_length = len(input_ids)
-                # assert input_ids_max_length <= args['max_input_length'], input_ids_max_length
-                input_ids = input_ids[: args["max_input_length"]]
-                labels = labels[: args["max_input_length"]]
-                attention_mask = attention_mask[: args["max_input_length"]]
 
                 ##
                 new_batch["input_ids"].append(input_ids)
@@ -991,6 +987,7 @@ class BCTrainer(BaseTrainer):
         n_epochs = self.args["n_epochs"]
         logging_epoch_freq = self.args["logging_epoch_freq"]
         evaluating_epoch_freq = self.args["evaluating_epoch_freq"]
+        eval_max_batches = self.args.get("eval_max_batches", None)
         saving_epoch_freq = self.args["saving_epoch_freq"]
         model_save_path = self.args["model_save_path"]
         os.makedirs(model_save_path, exist_ok=True)
@@ -1017,7 +1014,7 @@ class BCTrainer(BaseTrainer):
                 ):
                     evaluate_result_dict = {
                         f"Eval.Gen.{k}": v
-                        for k, v in self.eval_test_dataloader().items()
+                        for k, v in self.eval_test_dataloader(max_batches=eval_max_batches).items()
                     }
                     eval_log_dict.update(evaluate_result_dict)
                     if eval_log_dict["Eval.Gen.success"] > self.best_eval_log_dict.get(
@@ -1084,8 +1081,9 @@ class BCTrainer(BaseTrainer):
         self,
         dataloader=None,
         do_sample=False,
-        temperature=0.3,
+        temperature=0.8,
         record_to_file=True,
+        max_batches=None,
     ):
         # test
         self.agent.model.eval()
@@ -1094,12 +1092,14 @@ class BCTrainer(BaseTrainer):
         if dataloader is None:
             dataloader = self.test_dataloader
 
-        for _, batch in tqdm(
+        for batch_idx, batch in tqdm(
             enumerate(dataloader),
             total=len(dataloader),
             disable=not self.accelerator.is_main_process,
             desc="Evaluation Gen Loop",
         ):
+            if max_batches is not None and batch_idx >= int(max_batches):
+                break
             data_idxs = batch["data_idxs"]
             task_ids = batch.get("task_ids")
             if task_ids:
@@ -1108,7 +1108,9 @@ class BCTrainer(BaseTrainer):
             with torch.no_grad():
                 exps = self.eval(
                     generation_config=GenerationConfig(
-                        max_length=4096,
+                        # Explicit generation budget to avoid Transformers' small default max_length
+                        # cutting off before emitting the required "Action:" line.
+                        max_new_tokens=2048,
                         do_sample=do_sample,
                         temperature=temperature,
                         eos_token_id=self.agent.tokenizer.eos_token_id,
@@ -1126,7 +1128,7 @@ class BCTrainer(BaseTrainer):
                     [exp.reward for exp in exps.experiences]
                 ).to(self.accelerator.device)
                 cur_batch_success = torch.FloatTensor(
-                    [1 if exp.reward == 1 else 0 for exp in exps.experiences]
+                    [1 if float(exp.reward) in (1.0, 100.0) else 0 for exp in exps.experiences]
                 ).to(self.accelerator.device)
                 cur_batch_data_idx = torch.tensor(data_idxs).to(self.accelerator.device)
                 
@@ -1149,7 +1151,7 @@ class BCTrainer(BaseTrainer):
                             cur_idx = all_device_data_idx[idx]
                             conversation = exp.conversation
                             cur_reward = exp.reward
-                            cur_success = 1 if exp.reward == 1 else 0
+                            cur_success = 1 if float(cur_reward) in (1.0, 100.0) else 0
                             item_id = f"{self.args['task_name']}_{cur_idx}"
                             f.write(
                                 {
@@ -1654,7 +1656,6 @@ class QwenVLBCTrainer(BCTrainer):
                     images=images_batch,
                     return_tensors="pt",
                     truncation=False,
-                    max_length=args.get("max_input_length", 4096),
                     padding=True,
                 )
             else:
@@ -1662,7 +1663,6 @@ class QwenVLBCTrainer(BCTrainer):
                     text=texts,
                     return_tensors="pt",
                     truncation=False,
-                    max_length=args.get("max_input_length", 4096),
                     padding=True,
                 )
 
