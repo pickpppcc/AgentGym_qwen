@@ -69,6 +69,7 @@ class BaseTask:
                 "- For type(content=...): use a single-quoted string; use \\\\n to press Enter; escape quotes if needed.\n"
                 "- If waiting for the UI, output Action: wait().\n"
                 "- Only output Action: finished() when you are confident the user instruction is fully satisfied; if unsure, continue interacting instead.\n"
+                "- If the observation says finished() was rejected / not successful yet, do NOT repeat finished(); take additional actions to satisfy the requirements.\n"
                 "- If impossible or you need user help, output Action: call_user()."
             )
 
@@ -557,6 +558,17 @@ class BaseTask:
                 break
 
         if isinstance(agent, Agent):
+            # Best-effort per-episode logging for OSWorld: print task id and final score.
+            # This is helpful during batch evaluation to see progress beyond tqdm task ids.
+            try:
+                if self.env_name == "OSWorld":
+                    rank = str(os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0")))
+                    if rank == "0":
+                        task_id = getattr(client, "_current_task_id", None)
+                        status = "done" if done else "truncated" if (max_rounds is not None and rounds >= max_rounds) else "stopped"
+                        print(f"[OSWorld] task_id={task_id} idx={idx} status={status} score={float(reward):.3f}")
+            except Exception:
+                pass
             return ExperienceOutput(
                 conversation=conversation,
                 reward=reward,

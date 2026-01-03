@@ -116,20 +116,20 @@ class OSWorldEnvClient(BaseEnvClient):
 
         # 在 UITARS 基础模板后追加一个 few-shot 示例，帮助 Qwen 学会正确的 Thought / Action 格式。
         # 这里示例一个简单的“打开浏览器并访问 Amazon 页面”的步骤。
-        example_block = (
-            "\n\n"
-            "## Example (format demonstration)\n"
-            "Below is an example of the expected output format. "
-            "Follow this style in your own responses.\n\n"
-            "User Instruction: Open the browser and go to https://www.amazon.com, then click the 'Sign in' button.\n"
-            "Observation: The desktop is visible and a browser icon is on the taskbar.\n\n"
-            "Thought: I should first click the browser icon on the taskbar to open the browser, "
-            "then I can type the Amazon URL in the address bar.\n"
-            "Action: click(start_box='(120,1040)')\n\n"
-            "Now, for the current task, think step by step and respond in the same Thought and Action format."
-        )
-
-        full_prompt = user_prompt + example_block
+        # example_block = (
+        #     "\n\n"
+        #     "## Example (format demonstration)\n"
+        #     "Below is an example of the expected output format. "
+        #     "Follow this style in your own responses.\n\n"
+        #     "User Instruction: Open the browser and go to https://www.amazon.com, then click the 'Sign in' button.\n"
+        #     "Observation: The desktop is visible and a browser icon is on the taskbar.\n\n"
+        #     "Thought: I should first click the browser icon on the taskbar to open the browser, "
+        #     "then I can type the Amazon URL in the address bar.\n"
+        #     "Action: click(start_box='(120,1040)')\n\n"
+        #     "Now, for the current task, think step by step and respond in the same Thought and Action format."
+        # )
+        example_block =()
+        full_prompt = user_prompt
 
         # NOTE: keep the strict system prompt as a first "human" message so that:
         # - Text-only chat templates (that may not support system role) won't break;
@@ -205,7 +205,19 @@ class OSWorldEnvClient(BaseEnvClient):
             ob = r["observation"]  # type: ignore[index]
 
         if self.observe_format == "text":
-            return self._format_observation(ob)
+            base = self._format_observation(ob)
+            # Surface evaluation feedback when available (helps prevent repeated premature finished()).
+            try:
+                if isinstance(self.info, dict):
+                    if self.info.get("eval_feedback"):
+                        base = (base + "\nEval: " + str(self.info.get("eval_feedback"))).strip()
+                    elif self.info.get("eval_error"):
+                        base = (base + "\nEval error: " + str(self.info.get("eval_error"))).strip()
+                    elif self.info.get("score") is not None:
+                        base = (base + "\nEval score: " + str(self.info.get("score"))).strip()
+            except Exception:
+                pass
+            return base
         elif self.observe_format == "screenshot_base64":
             """
             为视觉语言模型返回「文本 + 截图」的组合：
@@ -227,6 +239,22 @@ class OSWorldEnvClient(BaseEnvClient):
                     raw_ss = ob.get("screenshot_base64", "")
                     if isinstance(raw_ss, str):
                         screenshot_b64 = raw_ss
+                # Surface evaluation feedback so the model knows whether finished() was accepted.
+                try:
+                    if isinstance(self.info, dict):
+                        if self.info.get("eval_feedback"):
+                            step_text = str(self.info.get("eval_feedback"))
+                        elif self.info.get("eval_error"):
+                            step_text = f"Evaluation error: {self.info.get('eval_error')}"
+                        elif self.info.get("score") is not None:
+                            score = float(self.info.get("score"))  # type: ignore[arg-type]
+                            is_done = bool(self.info.get("done"))
+                            if is_done:
+                                step_text = f"Evaluation: score={score:.3f} (success)"
+                            else:
+                                step_text = f"Evaluation: score={score:.3f} (not successful yet; keep working)"
+                except Exception:
+                    pass
                 payload = {
                     "instruction": instr or "",
                     "step_text": step_text,
@@ -380,7 +408,23 @@ class OSWorldEnvClient(BaseEnvClient):
 
             if func == "hotkey":
                 key = str(args.get("key", "")).strip()
-                keys = [k.strip() for k in key.split()] if key else []
+                # Models may emit "ctrl+c" / "ctrl+shift+s" or "ctrl c".
+                # Normalize to a list of individual key tokens expected by OSWorld controller.
+                if key:
+                    keys = [k.strip() for k in re.split(r"[+,\s]+", key) if k.strip()]
+                else:
+                    keys = []
+                # Common aliases
+                normalized: list[str] = []
+                for k in keys:
+                    kk = k.strip().lower()
+                    if kk in {"cmd", "command"}:
+                        normalized.append("command")
+                    elif kk in {"win", "windows", "super"}:
+                        normalized.append("win")
+                    else:
+                        normalized.append(kk)
+                keys = normalized
                 return {"action_type": "HOTKEY", "parameters": {"keys": keys}}
 
             if func == "type":
@@ -388,16 +432,39 @@ class OSWorldEnvClient(BaseEnvClient):
                 return {"action_type": "TYPING", "parameters": {"text": content}}
 
             if func == "scroll":
-                direction = str(args.get("direction", "")).strip().lower()
-                dy = -120 if direction == "down" else 120 if direction == "up" else 0
-                return {"action_type": "SCROLL", "parameters": ({"dy": dy} if dy != 0 else {})}
+                direction_raw = str(args.get("direction", "")).strip().lower()
+                # Some models emit empty/verbose directions like "down or up or right or left".
+                # Never send an empty SCROLL parameters dict to the controller (it will crash).
+                direction = direction_raw or "down"
+                if "down" in direction:
+                    return {"action_type": "SCROLL", "parameters": {"dy": -120}}
+                if "up" in direction:
+                    return {"action_type": "SCROLL", "parameters": {"dy": 120}}
+                if "left" in direction:
+                    return {"action_type": "SCROLL", "parameters": {"dx": -120}}
+                if "right" in direction:
+                    return {"action_type": "SCROLL", "parameters": {"dx": 120}}
+                # Fallback: scroll down a bit
+                return {"action_type": "SCROLL", "parameters": {"dy": -120}}
 
             if func == "drag":
+                start_pt = _parse_point(str(args.get("start_box", "")))
                 end_pt = _parse_point(str(args.get("end_box", "")))
+                if start_pt and end_pt:
+                    x1, y1 = start_pt
+                    x2, y2 = end_pt
+                    # Use a pyautogui script so we can honor BOTH start_box and end_box in one step.
+                    # DesktopEnv(action_space="pyautogui") supports executing raw python via controller.execute_python_command.
+                    return (
+                        "pyautogui.FAILSAFE = False; "
+                        f"pyautogui.moveTo({x1}, {y1}, duration=0.2); "
+                        f"pyautogui.dragTo({x2}, {y2}, duration=1.0, button='left', mouseDownUp=True)"
+                    )
                 if end_pt:
                     x, y = end_pt
                     return {"action_type": "DRAG_TO", "parameters": {"x": x, "y": y}}
-                return {"action_type": "DRAG_TO", "parameters": {}}
+                # Fallback: do nothing harmful.
+                return "WAIT"
 
             # 其他未覆盖的动作原样返回
             return s
@@ -422,9 +489,15 @@ class OSWorldEnvClient(BaseEnvClient):
         if isinstance(act_or_dict, str):
             s = act_or_dict.strip().upper()
             if s not in {"WAIT", "DONE", "FAIL"}:
-                act_or_dict = "WAIT"
+                # Allow a narrow class of raw python actions (pyautogui-only) for tasks like drag(start,end).
+                # Everything else falls back to WAIT to avoid executing arbitrary code.
+                if re.search(r"(?i)\bpyautogui\.", act_or_dict) or re.search(r"(?i)^\s*import\s+pyautogui\b", act_or_dict):
+                    pass
+                else:
+                    act_or_dict = "WAIT"
         resp = self._post("step", {"action": act_or_dict, "pause": self._step_pause_seconds})
         self.info = resp
+        print(f"action: {action}")
         # 自增步号并保存截图
         try:
             self._step_index += 1

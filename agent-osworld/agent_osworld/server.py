@@ -3,6 +3,8 @@ from __future__ import annotations
 import base64
 import math
 import threading
+import os
+import time
 from typing import Any, Dict, Optional
 
 from fastapi import FastAPI
@@ -46,12 +48,16 @@ class CreateRequestBody(BaseModel):
     require_a11y_tree: Optional[bool] = None
     require_terminal: Optional[bool] = None
     os_type: Optional[str] = None
+    # AgentGym-only convenience: unlock the desktop after reset (does not modify OSWorld code).
     client_password: Optional[str] = None
     auto_unlock: Optional[bool] = None
     # AgentGym-specific: automatically call OSWorld DesktopEnv.evaluate() after each step
     # and mark done when score reaches the threshold.
     auto_evaluate: Optional[bool] = None
     done_score_threshold: Optional[float] = None
+    # AgentGym-specific: if true, treat "finished()/DONE" as a hard stop regardless of evaluation score.
+    # Evaluation (if available) may still be computed and returned as reward/score, but will not gate termination.
+    force_done_on_finished: Optional[bool] = None
 
 
 class StepRequestBody(BaseModel):
@@ -86,6 +92,56 @@ class OSWorldServer:
         self.ls: list[int] = []
         self._auto_evaluate: Dict[int, bool] = {}
         self._done_score_threshold: Dict[int, float] = {}
+        self._client_password: Dict[int, str] = {}
+        self._auto_unlock: Dict[int, bool] = {}
+        self._force_done_on_finished: Dict[int, bool] = {}
+        # If the agent calls DONE but evaluation fails, remember it and reject repeated DONE
+        # until a non-DONE action happens (prevents infinite finished()->finished() loops).
+        self._done_rejected: Dict[int, bool] = {}
+        self._last_rejected_score: Dict[int, float] = {}
+        self._last_action_repr: Dict[int, str] = {}
+        self._repeat_action_count: Dict[int, int] = {}
+
+    def _maybe_unlock_screen(self, env: DesktopEnv, password: str) -> None:
+        ctrl = getattr(env, "controller", None)
+        if ctrl is None or not hasattr(ctrl, "execute_python_command"):
+            return
+        pwd = (password or "").strip()
+        # Best-effort unlock:
+        # - wake lock screen
+        # - open password prompt
+        # - try blank password, then provided password (if any)
+        # - dismiss stray overlays afterwards
+        cmd = "\n".join(
+            [
+                "import time",
+                "import pyautogui",
+                "pyautogui.FAILSAFE = False",
+                "time.sleep(0.2)",
+                "pyautogui.press('esc')",
+                "time.sleep(0.2)",
+                "pyautogui.press('esc')",
+                "time.sleep(0.2)",
+                "pyautogui.press('enter')",
+                "time.sleep(0.4)",
+                f"pwd = {pwd!r}",
+                "if not pwd:",
+                "    pyautogui.press('enter')",
+                "    time.sleep(0.6)",
+                "else:",
+                "    pyautogui.typewrite(pwd)",
+                "    time.sleep(0.1)",
+                "    pyautogui.press('enter')",
+                "    time.sleep(0.8)",
+                "pyautogui.press('esc')",
+                "time.sleep(0.1)",
+                "pyautogui.press('esc')",
+            ]
+        )
+        try:
+            ctrl.execute_python_command(cmd)
+        except Exception:
+            return
 
     def _next_id(self) -> int:
         with self._lock:
@@ -113,8 +169,6 @@ class OSWorldServer:
             require_a11y_tree=True if cfg.get("require_a11y_tree") is None else bool(cfg.get("require_a11y_tree")),
             require_terminal=False if cfg.get("require_terminal") is None else bool(cfg.get("require_terminal")),
             os_type=(cfg.get("os_type") or "Ubuntu"),
-            client_password=(cfg.get("client_password") or ""),
-            auto_unlock=True if cfg.get("auto_unlock") is None else bool(cfg.get("auto_unlock")),
         )
         # Some OSWorld evaluators (e.g., Chrome getters) expect these proxy flags to exist on env.
         # AgentGym's server path doesn't manage proxy, so default them to False to avoid AttributeError.
@@ -126,6 +180,19 @@ class OSWorldServer:
         self.ls.append(env_id)
         self._auto_evaluate[env_id] = bool(cfg.get("auto_evaluate")) if cfg.get("auto_evaluate") is not None else False
         self._done_score_threshold[env_id] = float(cfg.get("done_score_threshold")) if cfg.get("done_score_threshold") is not None else 1.0
+        self._client_password[env_id] = str(cfg.get("client_password") or "")
+        self._auto_unlock[env_id] = True if cfg.get("auto_unlock") is None else bool(cfg.get("auto_unlock"))
+        # "finished()/DONE" behavior:
+        # - Default: hard-stop on DONE (what AgentGym wants for offline rollouts / debug loops).
+        # - Override: pass create_cfg.force_done_on_finished=false or set env var to a falsy value.
+        env_default = os.environ.get("AGENTGYM_OSWORLD_FORCE_DONE_ON_FINISHED", "").strip()
+        if cfg.get("force_done_on_finished") is None:
+            if env_default == "":
+                self._force_done_on_finished[env_id] = True
+            else:
+                self._force_done_on_finished[env_id] = env_default in {"1", "true", "True", "yes", "Y"}
+        else:
+            self._force_done_on_finished[env_id] = bool(cfg.get("force_done_on_finished"))
         self.info[env_id] = {
             "observation": {},
             "reward": 0.0,
@@ -136,17 +203,119 @@ class OSWorldServer:
 
     def step(self, env_id: int, action: Any, pause: float = 2) -> Dict[str, Any]:
         env = self.env[env_id]
-        ob, reward, done, info = env.step(action, pause=pause)
+        # Detect obvious "stuck" loops (same action repeated many times).
+        # We do not force-stop the episode; we only surface feedback to the agent to change strategy.
+        try:
+            cur_repr = repr(action)
+            if self._last_action_repr.get(env_id) == cur_repr:
+                self._repeat_action_count[env_id] = int(self._repeat_action_count.get(env_id, 1)) + 1
+            else:
+                self._repeat_action_count[env_id] = 1
+            self._last_action_repr[env_id] = cur_repr
+        except Exception:
+            pass
+
+        # AgentGym-side extension:
+        # Allow a narrow class of raw `pyautogui...` python snippets (generated by our UI-TARS adapter)
+        # even when OSWorld is running with `action_space="computer_13"`.
+        # OSWorld's `DesktopEnv.step()` would otherwise route strings to `controller.execute_action()` and crash.
+        if (
+            isinstance(action, str)
+            and env.action_space == "computer_13"
+            and ("pyautogui." in action or action.lstrip().startswith("import pyautogui"))
+        ):
+            reward, done, info = 0.0, False, {}
+            try:
+                env._step_no += 1  # noqa: SLF001
+                env.action_history.append(action)  # type: ignore[arg-type]
+            except Exception:
+                pass
+            ctrl = getattr(env, "controller", None)
+            if ctrl is None or not hasattr(ctrl, "execute_python_command"):
+                raise RuntimeError("controller.execute_python_command not available for pyautogui action")
+            ctrl.execute_python_command(action)
+            time.sleep(pause)
+            ob = env._get_obs()  # noqa: SLF001
+        else:
+            ob, reward, done, info = env.step(action, pause=pause)
         ob_json = _sanitize_observation(ob)
         score = None
         eval_error: Optional[str] = None
+        eval_feedback: Optional[str] = None
         auto_eval = bool(self._auto_evaluate.get(env_id, False))
         already_scored = isinstance(info, dict) and ("score" in info)
+        requested_done = (
+            action == "DONE"
+            or (isinstance(action, dict) and action.get("action_type") == "DONE")
+        )
         if already_scored:
             try:
                 score = float(info.get("score"))  # type: ignore[call-arg]
             except Exception:
                 score = None
+
+        # Clear reject state when the agent actually takes a non-DONE action.
+        if not requested_done:
+            self._done_rejected.pop(env_id, None)
+            self._last_rejected_score.pop(env_id, None)
+
+        # If requested: always terminate on DONE, regardless of score.
+        if requested_done and bool(self._force_done_on_finished.get(env_id, False)):
+            if hasattr(env, "evaluator"):
+                try:
+                    raw = env.evaluate()
+                    score = float(raw)
+                    if math.isfinite(score):
+                        reward = float(score)
+                    else:
+                        raise ValueError(f"Non-finite evaluation score: {raw!r}")
+                except Exception as e:
+                    eval_error = f"{type(e).__name__}: {e}"
+                    logger.exception("EVAL_ON_FORCE_DONE_FAILED id=%s", env_id)
+            done = True
+        # Otherwise, gate "finished()/DONE": only terminate when evaluator confirms success.
+        # Gate "finished()/DONE": only terminate when evaluator confirms success.
+        # This prevents the model from ending the episode prematurely and losing the chance to continue.
+        elif requested_done and hasattr(env, "evaluator"):
+            if bool(self._done_rejected.get(env_id, False)):
+                # Repeated DONE without any other actions: don't re-run expensive evaluators.
+                score = float(self._last_rejected_score.get(env_id, 0.0))
+                done = False
+                eval_feedback = (
+                    f"Finished was rejected (score={score:.3f}); take more actions before calling finished() again."
+                )
+            else:
+                try:
+                    raw = env.evaluate()
+                    score = float(raw)
+                    if not math.isfinite(score):
+                        raise ValueError(f"Non-finite evaluation score: {raw!r}")
+                    reward = float(score)
+                    threshold = float(self._done_score_threshold.get(env_id, 1.0))
+                    done = bool(score >= threshold)
+                    if not done:
+                        self._done_rejected[env_id] = True
+                        self._last_rejected_score[env_id] = float(score)
+                        eval_feedback = (
+                            f"Finished was rejected (score={score:.3f}); continue working and ensure the task requirements are met."
+                        )
+                    else:
+                        self._done_rejected.pop(env_id, None)
+                        self._last_rejected_score.pop(env_id, None)
+                except Exception as e:
+                    eval_error = f"{type(e).__name__}: {e}"
+                    logger.exception("EVAL_ON_DONE_FAILED id=%s", env_id)
+
+        # If we are looping on the same action, attach a hint so the model stops repeating it.
+        try:
+            rep_cnt = int(self._repeat_action_count.get(env_id, 0))
+            if not done and rep_cnt >= 6 and not eval_feedback:
+                eval_feedback = (
+                    f"Action seems repeated {rep_cnt} times; likely no effect. "
+                    f"Try a different action (e.g., click a different UI element, or use drag instead of scroll)."
+                )
+        except Exception:
+            pass
 
         if auto_eval and not already_scored:
             if hasattr(env, "evaluator"):
@@ -220,6 +389,8 @@ class OSWorldServer:
             payload["success"] = bool(payload["done"])
         if eval_error:
             payload["eval_error"] = eval_error
+        if eval_feedback:
+            payload["eval_feedback"] = eval_feedback
         # 缓存最近一次摘要
         try:
             self.info[env_id] = payload | {"info": info, "action": action}
@@ -243,6 +414,12 @@ class OSWorldServer:
         if not hasattr(env, "enable_proxy"):
             setattr(env, "enable_proxy", False)
         ob = env.reset(task_config=task_config, seed=seed)
+        # Best-effort unlock after reset (some snapshots boot into lock screen before GNOME settings apply).
+        try:
+            if bool(self._auto_unlock.get(env_id, True)):
+                self._maybe_unlock_screen(env, self._client_password.get(env_id, ""))
+        except Exception:
+            pass
         ob_json = _sanitize_observation(ob)
         payload: Dict[str, Any] = {
             "observation": ob_json,
@@ -314,6 +491,13 @@ class OSWorldServer:
             self.info.pop(env_id, None)
             self._auto_evaluate.pop(env_id, None)
             self._done_score_threshold.pop(env_id, None)
+            self._client_password.pop(env_id, None)
+            self._auto_unlock.pop(env_id, None)
+            self._force_done_on_finished.pop(env_id, None)
+            self._done_rejected.pop(env_id, None)
+            self._last_rejected_score.pop(env_id, None)
+            self._last_action_repr.pop(env_id, None)
+            self._repeat_action_count.pop(env_id, None)
             return {"closed": True}
         except KeyError:
             return {"closed": False, "error": "Env not exist"}
