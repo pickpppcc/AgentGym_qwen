@@ -64,6 +64,16 @@ def _decode_image_from_base64(b64_str: str) -> Image.Image:
     img = Image.open(BytesIO(raw))
     return img.convert("RGB")
 
+def _save_img(img: Image.Image, fpath: str, ext: str) -> bool:
+    try:
+        if ext in ("jpg", "jpeg"):
+            img.save(fpath, format="JPEG", quality=95)
+        else:
+            img.save(fpath, format="PNG")
+        return True
+    except Exception:
+        return False
+
 
 def _merge_text_from_inner(inner: dict) -> str:
     instr = inner.get("instruction") or ""
@@ -385,8 +395,36 @@ def main() -> int:
     ap.add_argument("--max_rounds", type=int, default=15, help="Max rounds (pairs) to keep per conversation")
     ap.add_argument("--image_ext", default="png", choices=["png", "jpg", "jpeg"], help="Image file extension")
     ap.add_argument("--limit_items", type=int, default=0, help="For debugging: only process first N items (0=all)")
-    ap.add_argument("--normalize_actions", action="store_true", help="Normalize assistant outputs to strict Thought/Action + UITARS action calls")
-    ap.add_argument("--drop_unparseable", action="store_true", help="Drop prefix samples that contain unparseable assistant actions")
+    # Defaults are "on" so users don't need to pass extra flags for strict UITARS format.
+    ap.set_defaults(normalize_actions=True, drop_unparseable=True)
+    ap.add_argument(
+        "--normalize_actions",
+        action="store_true",
+        help="Normalize assistant outputs to strict Thought/Action + UITARS action calls (default: on)",
+    )
+    ap.add_argument(
+        "--no_normalize_actions",
+        action="store_false",
+        dest="normalize_actions",
+        help="Disable assistant action normalization",
+    )
+    ap.add_argument(
+        "--drop_unparseable",
+        action="store_true",
+        help="Drop prefix samples that contain unparseable assistant actions (default: on)",
+    )
+    ap.add_argument(
+        "--no_drop_unparseable",
+        action="store_false",
+        dest="drop_unparseable",
+        help="Keep prefix samples even if assistant actions are unparseable",
+    )
+    ap.add_argument(
+        "--save_assistant_images",
+        action="store_true",
+        default=False,
+        help="Also save assistant (msg1) screenshots (default: only msg0)",
+    )
     args = ap.parse_args()
 
     with open(args.input, "r", encoding="utf-8") as f:
@@ -441,6 +479,8 @@ def main() -> int:
             pm1, pm2 = parsed_rounds[round_idx0]
             paths: List[str] = []
             for msg_i, pm in enumerate((pm1, pm2)):
+                if msg_i == 1 and not args.save_assistant_images:
+                    continue
                 if not pm.screenshot_b64:
                     continue
                 try:
@@ -450,16 +490,12 @@ def main() -> int:
                 fname = f"round{r1:03d}_msg{msg_i}.{args.image_ext}"
                 fpath = os.path.join(orig_dir, fname)
                 try:
-                    if args.image_ext in ("jpg", "jpeg"):
-                        img.save(fpath, format="JPEG", quality=95)
-                    else:
-                        img.save(fpath, format="PNG")
-                    paths.append(
-                        os.path.relpath(
+                    if _save_img(img, fpath, args.image_ext):
+                        rel = os.path.relpath(
                             fpath,
                             start=os.path.dirname(args.out_jsonl) or ".",
                         )
-                    )
+                        paths.append(rel)
                 except Exception:
                     continue
             saved_paths_by_round[round_idx0] = paths
@@ -502,16 +538,16 @@ def main() -> int:
             for r in range(k):
                 images_per_round.append(saved_paths_by_round[r])
 
-            merged_rows.append(
-                {
-                    "item_id": new_item_id,
-                    "orig_item_id": orig_item_id,
-                    "round_idx": k,
-                    "num_rounds": keep_rounds,
-                    "conversations": out_convs,
-                    "images": images_per_round,
-                }
-            )
+            out_row = {
+                "item_id": new_item_id,
+                "orig_item_id": orig_item_id,
+                "round_idx": k,
+                "num_rounds": keep_rounds,
+                "conversations": out_convs,
+                "images": images_per_round,
+            }
+
+            merged_rows.append(out_row)
             stats["prefix_rows_written"] += 1
 
         stats["items_used"] += 1
