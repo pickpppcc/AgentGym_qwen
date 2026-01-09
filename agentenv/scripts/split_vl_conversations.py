@@ -395,6 +395,18 @@ def main() -> int:
     ap.add_argument("--max_rounds", type=int, default=15, help="Max rounds (pairs) to keep per conversation")
     ap.add_argument("--image_ext", default="png", choices=["png", "jpg", "jpeg"], help="Image file extension")
     ap.add_argument("--limit_items", type=int, default=0, help="For debugging: only process first N items (0=all)")
+    ap.set_defaults(absolute_image_paths=True)
+    ap.add_argument(
+        "--absolute_image_paths",
+        action="store_true",
+        help="Write absolute image paths into JSONL (default: on)",
+    )
+    ap.add_argument(
+        "--relative_image_paths",
+        action="store_false",
+        dest="absolute_image_paths",
+        help="Write image paths relative to the JSONL directory",
+    )
     # Defaults are "on" so users don't need to pass extra flags for strict UITARS format.
     ap.set_defaults(normalize_actions=True, drop_unparseable=True)
     ap.add_argument(
@@ -491,11 +503,15 @@ def main() -> int:
                 fpath = os.path.join(orig_dir, fname)
                 try:
                     if _save_img(img, fpath, args.image_ext):
-                        rel = os.path.relpath(
-                            fpath,
-                            start=os.path.dirname(args.out_jsonl) or ".",
-                        )
-                        paths.append(rel)
+                        if args.absolute_image_paths:
+                            paths.append(os.path.abspath(fpath))
+                        else:
+                            paths.append(
+                                os.path.relpath(
+                                    fpath,
+                                    start=os.path.dirname(args.out_jsonl) or ".",
+                                )
+                            )
                 except Exception:
                     continue
             saved_paths_by_round[round_idx0] = paths
