@@ -115,6 +115,21 @@ def _normalize_whitespace(s: str) -> str:
     s = re.sub(r"\s+", " ", s)
     return s.strip()
 
+def _is_truthy(v: Any) -> bool:
+    if v is True:
+        return True
+    if v is False or v is None:
+        return False
+    if isinstance(v, (int, float)):
+        return v != 0
+    if isinstance(v, str):
+        s = v.strip().lower()
+        if s in {"true", "t", "yes", "y", "1"}:
+            return True
+        if s in {"false", "f", "no", "n", "0", ""}:
+            return False
+    return bool(v)
+
 
 def _extract_first_action_call(text: str) -> Optional[str]:
     """
@@ -364,7 +379,8 @@ def _maybe_extract_preamble(conversations: List[Dict[str, Any]]) -> Tuple[Option
     a0_loss = a0.get("loss", None)
 
     looks_like_prefix = ("Output Format" in h0_text) or ("Action Space" in h0_text) or ("You are a GUI agent" in h0_text)
-    looks_like_ok = a0_text in {"ok.", "ok", "okay"} and (a0_loss is False)
+    # Some datasets omit `loss` or serialize it oddly; treat any truthy value as "not ok" for preamble stripping.
+    looks_like_ok = a0_text in {"ok.", "ok", "okay"} and (not _is_truthy(a0_loss))
     if not (looks_like_prefix and looks_like_ok):
         return None, conversations
 

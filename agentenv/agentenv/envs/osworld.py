@@ -18,7 +18,7 @@ from mm_agents.uitars15_v1 import (
     parse_action,
     UITARS_ACTION_SPACE,
     UITARS_USR_PROMPT_THOUGHT,
-    UITARS_SYS_PROMPT_THOUGHT_STRICT,
+
 )
 
 

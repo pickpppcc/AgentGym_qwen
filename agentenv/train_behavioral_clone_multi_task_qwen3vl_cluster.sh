@@ -83,7 +83,7 @@ accelerate launch \
   --clip_grad_norm "1" \
   --evaluating_epoch_freq "100" \
   --logging_epoch_freq "1" \
-  --saving_epoch_freq "100" \
+  --saving_epoch_freq "1" \
   --save_latest_only "true" \
   --logging_step_freq "5" \
   --seed "42" \
@@ -107,4 +107,3 @@ accelerate launch \
   --debug "true" \
   --debug_max_tokens "512" \
   --assistant_only_loss "true"
-

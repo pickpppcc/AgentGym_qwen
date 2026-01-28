@@ -15,6 +15,8 @@ import base64
 import jsonlines
 import numpy as np
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 import wandb
 from accelerate import Accelerator, InitProcessGroupKwargs, DistributedDataParallelKwargs, DeepSpeedPlugin
 
@@ -35,6 +37,213 @@ try:
 except Exception:
     # Pillow 仅在 VL 多模态路径下才需要；若不存在则退化为纯文本训练。
     Image = None
+
+
+class LoRALinear(nn.Module):
+    """
+    Minimal LoRA wrapper for nn.Linear (no external deps like peft).
+    Base weights are frozen; only LoRA A/B are trainable.
+    """
+
+    def __init__(self, base: nn.Linear, r: int = 8, alpha: int = 16, dropout: float = 0.0):
+        super().__init__()
+        if not isinstance(base, nn.Linear):
+            raise TypeError(f"LoRALinear expects nn.Linear, got {type(base)}")
+        if r <= 0:
+            raise ValueError("LoRA rank r must be > 0")
+        self.base = base
+        self.r = int(r)
+        self.alpha = int(alpha)
+        self.scaling = float(alpha) / float(r)
+        self.dropout = nn.Dropout(float(dropout)) if float(dropout) > 0 else nn.Identity()
+
+        # Freeze base params
+        self.base.weight.requires_grad = False
+        if getattr(self.base, "bias", None) is not None:
+            self.base.bias.requires_grad = False
+
+        # LoRA weights (init: A ~ N(0, 0.01), B = 0 so initial delta=0)
+        in_features = int(self.base.in_features)
+        out_features = int(self.base.out_features)
+        dtype = self.base.weight.dtype
+        device = self.base.weight.device
+
+        self.lora_A = nn.Parameter(torch.empty((self.r, in_features), device=device, dtype=dtype))
+        self.lora_B = nn.Parameter(torch.zeros((out_features, self.r), device=device, dtype=dtype))
+        nn.init.normal_(self.lora_A, mean=0.0, std=0.01)
+
+    def forward(self, x):
+        out = self.base(x)
+        # x: [..., in] -> [..., r] -> [..., out]
+        dx = F.linear(self.dropout(x), self.lora_A)
+        dx = F.linear(dx, self.lora_B) * self.scaling
+        return out + dx
+
+
+def _iter_named_modules_with_parents(model: nn.Module):
+    """Yield (full_name, module, parent_module, child_name)."""
+    for full_name, module in model.named_modules():
+        if not full_name:
+            continue
+        parent_name, _, child = full_name.rpartition(".")
+        parent = model.get_submodule(parent_name) if parent_name else model
+        yield full_name, module, parent, child
+
+
+def inject_lora_into_linear_modules(
+    model: nn.Module,
+    *,
+    name_keywords: Sequence[str],
+    r: int,
+    alpha: int,
+    dropout: float,
+) -> int:
+    """
+    Replace nn.Linear modules whose full module name contains any keyword with LoRALinear.
+    Returns number of injected modules.
+    """
+    if not name_keywords:
+        return 0
+    kws = [str(k).lower() for k in name_keywords if str(k).strip()]
+    injected = 0
+    for full_name, module, parent, child in list(_iter_named_modules_with_parents(model)):
+        if not isinstance(module, nn.Linear):
+            continue
+        ln = full_name.lower()
+        if not any(k in ln for k in kws):
+            continue
+        # Avoid double-wrapping.
+        if isinstance(module, LoRALinear):
+            continue
+        try:
+            setattr(parent, child, LoRALinear(module, r=r, alpha=alpha, dropout=dropout))
+            injected += 1
+        except Exception:
+            continue
+    return injected
+
+
+def inject_lora_into_linear_modules_in_subtrees(
+    model: nn.Module,
+    *,
+    root_module_paths: Sequence[str],
+    r: int,
+    alpha: int,
+    dropout: float,
+) -> int:
+    """
+    Replace nn.Linear modules under specific module subtrees with LoRALinear.
+
+    This is safer than global keyword matching because it avoids touching the LLM
+    branch when we only want to adapt vision-related modules (vision tower / projector).
+    """
+    roots = [str(p).strip() for p in (root_module_paths or []) if str(p).strip()]
+    if not roots:
+        return 0
+
+    def _under_any_root(full_name: str) -> bool:
+        for rt in roots:
+            if full_name == rt or full_name.startswith(rt + "."):
+                return True
+        return False
+
+    injected = 0
+    for full_name, module, parent, child in list(_iter_named_modules_with_parents(model)):
+        if not _under_any_root(full_name):
+            continue
+        if not isinstance(module, nn.Linear):
+            continue
+        if isinstance(module, LoRALinear):
+            continue
+        try:
+            setattr(parent, child, LoRALinear(module, r=r, alpha=alpha, dropout=dropout))
+            injected += 1
+        except Exception:
+            continue
+    return injected
+
+
+def _shorten_module_roots(paths: Sequence[str]) -> list[str]:
+    """
+    Drop redundant nested roots:
+      - keep 'model.visual' and drop 'model.visual.blocks.0' etc.
+    """
+    uniq: list[str] = []
+    for p in sorted({str(x).strip() for x in paths if str(x).strip()}, key=len):
+        if any(p == q or p.startswith(q + ".") for q in uniq):
+            continue
+        uniq.append(p)
+    return uniq
+
+
+def merge_and_strip_lora_from_state_dict(
+    state_dict: dict,
+    *,
+    r: int,
+    alpha: int,
+) -> dict:
+    """
+    Convert a LoRALinear-wrapped state_dict into a plain nn.Linear-compatible one by:
+      - merging deltaW into `.base.weight`
+      - renaming `.base.weight` -> `.weight` (and `.base.bias` -> `.bias`)
+      - dropping `.lora_A` / `.lora_B` tensors
+
+    This makes the saved checkpoint loadable by the original HF model class
+    (without requiring LoRALinear wrappers at load time).
+    """
+    if not state_dict:
+        return state_dict
+
+    try:
+        scaling = float(alpha) / float(r)
+    except Exception:
+        scaling = 1.0
+
+    # Work on a shallow copy; tensors are re-used unless explicitly replaced.
+    out = dict(state_dict)
+
+    # Find all LoRA blocks by `.lora_A` keys.
+    lora_A_suffix = ".lora_A"
+    lora_B_suffix = ".lora_B"
+    base_w_suffix = ".base.weight"
+    base_b_suffix = ".base.bias"
+
+    for k in list(state_dict.keys()):
+        if not isinstance(k, str) or not k.endswith(lora_A_suffix):
+            continue
+        prefix = k[: -len(lora_A_suffix)]
+        kA = prefix + lora_A_suffix
+        kB = prefix + lora_B_suffix
+        kW = prefix + base_w_suffix
+        kBias = prefix + base_b_suffix
+
+        if kA not in state_dict or kB not in state_dict or kW not in state_dict:
+            continue
+
+        A = state_dict[kA]
+        B = state_dict[kB]
+        W = state_dict[kW]
+
+        try:
+            # Merge in fp32 on CPU for numerical stability, then cast back.
+            # Shapes:
+            #   W: [out, in], A: [r, in], B: [out, r]
+            dW = (B.float() @ A.float()) * scaling
+            merged = (W.float() + dW).to(dtype=W.dtype)
+        except Exception:
+            # If anything goes wrong (dtype/device), fall back to keeping base weight.
+            merged = W
+
+        # Write merged plain Linear keys.
+        out[prefix + ".weight"] = merged
+        if kBias in state_dict:
+            out[prefix + ".bias"] = state_dict[kBias]
+
+        # Drop LoRA wrapper-specific keys.
+        for kk in (kA, kB, kW, kBias):
+            out.pop(kk, None)
+
+    return out
 
 
 class BCTrainer(BaseTrainer):
@@ -298,6 +507,71 @@ class BCTrainer(BaseTrainer):
             mpf_ctx = self.accelerator.main_process_first()
 
         with mpf_ctx:
+            def _normalize_openai_messages_schema(ex: dict) -> dict:
+                """
+                HuggingFace Datasets + pyarrow require consistent nested types.
+                Our VL JSONL sometimes mixes:
+                  - user.content: list[dict] (image+text blocks)
+                  - assistant.content: str
+                which triggers: ArrowInvalid: cannot mix list and non-list, non-null values.
+
+                Normalize to: message["content"] is always a list of blocks, and tool_calls
+                is always a list (or absent).
+                """
+                try:
+                    msgs = ex.get("messages")
+                except Exception:
+                    return ex
+                if not isinstance(msgs, list):
+                    return ex
+
+                new_msgs = []
+                for m in msgs:
+                    if not isinstance(m, dict):
+                        continue
+                    mm = dict(m)
+
+                    # Normalize content -> list[dict]
+                    c = mm.get("content", None)
+                    if isinstance(c, list):
+                        blocks = []
+                        for part in c:
+                            if isinstance(part, dict):
+                                blocks.append(part)
+                            elif isinstance(part, str):
+                                blocks.append({"type": "text", "text": part})
+                            elif part is None:
+                                continue
+                            else:
+                                blocks.append({"type": "text", "text": str(part)})
+                        mm["content"] = blocks
+                    elif isinstance(c, dict):
+                        mm["content"] = [c]
+                    elif isinstance(c, str):
+                        mm["content"] = [{"type": "text", "text": c}]
+                    elif c is None:
+                        mm["content"] = []
+                    else:
+                        mm["content"] = [{"type": "text", "text": str(c)}]
+
+                    # Normalize tool_calls -> list[dict] if present
+                    tc = mm.get("tool_calls", None)
+                    if isinstance(tc, dict):
+                        mm["tool_calls"] = [tc]
+                    elif tc is None:
+                        # keep as None (pyarrow will treat missing/None consistently)
+                        pass
+                    elif isinstance(tc, list):
+                        mm["tool_calls"] = [x for x in tc if isinstance(x, dict)]
+                    else:
+                        mm["tool_calls"] = []
+
+                    new_msgs.append(mm)
+
+                ex2 = dict(ex)
+                ex2["messages"] = new_msgs
+                return ex2
+
             def _load_list_from_path(path):
                 path = os.path.expanduser(path)
                 ext = os.path.splitext(path)[1].lower()
@@ -315,6 +589,17 @@ class BCTrainer(BaseTrainer):
                 if isinstance(obj, list):
                     return [x for x in obj if isinstance(x, dict)]
                 if isinstance(obj, dict):
+                    # Allow a single-example JSON (common for quick smoke tests):
+                    try:
+                        conv = obj.get("conversations")
+                        if (
+                            isinstance(conv, list)
+                            and any(k in obj for k in ["item_id", "orig_item_id"])
+                            and all(isinstance(m, dict) for m in conv[:2])
+                        ):
+                            return [obj]
+                    except Exception:
+                        pass
                     # Try common keys
                     for key in ["data", "examples", "train", "inference", "test"]:
                         v = obj.get(key)
@@ -334,6 +619,11 @@ class BCTrainer(BaseTrainer):
             train_list = _load_list_from_path(self.args["train_file"])
             infer_list = _load_list_from_path(self.args["inference_file"])
             test_list = _load_list_from_path(self.args["test_file"])
+
+            # Normalize nested message schema to keep pyarrow happy.
+            train_list = [_normalize_openai_messages_schema(x) for x in train_list]
+            infer_list = [_normalize_openai_messages_schema(x) for x in infer_list]
+            test_list = [_normalize_openai_messages_schema(x) for x in test_list]
 
             # limit train samples for quick smoke test if specified
             max_samples = self.args.get("train_max_samples")
@@ -368,6 +658,106 @@ class BCTrainer(BaseTrainer):
             new_batch = defaultdict(list)
             all_keys = list(batch.keys())
             use_vl = bool(is_vision_language and processor is not None)
+            # Optional system prompt (applied to the first human turn only).
+            # Can be provided via args.system_prompt or env AGENTGYM_SYSTEM_PROMPT.
+            try:
+                system_prompt = (
+                    args.get("system_prompt")
+                    or os.environ.get("AGENTGYM_SYSTEM_PROMPT", "")
+                )
+                system_prompt = str(system_prompt).strip()
+            except Exception:
+                processed_width=1920
+                processed_height=1080
+                description_prompt_lines = [
+            "Use a mouse and keyboard to interact with a computer, and take screenshots.",
+            "* This is an interface to a desktop GUI. You do not have access to a terminal or applications menu. You must click on desktop icons to start applications.",
+            "* Some applications may take time to start or process actions, so you may need to wait and take successive screenshots to see the results of your actions. E.g. if you click on Firefox and a window doesn't open, try wait and taking another screenshot.",
+            (
+                f"* The screen's resolution is {processed_width}x{processed_height}."
+                if self.coordinate_type == "absolute"
+                else "* The screen's resolution is 1000x1000."
+            ),
+            "* Whenever you intend to move the cursor to click on an element like an icon, you should consult a screenshot to determine the coordinates of the element before moving the cursor.",
+            "* If you tried clicking on a program or link but it failed to load even after waiting, try adjusting your cursor position so that the tip of the cursor visually falls on the element that you want to click.",
+            "* Make sure to click any buttons, links, icons, etc with the cursor tip in the center of the element. Don't click boxes on their edges unless asked.",
+        ]
+                description_prompt = "\n".join(description_prompt_lines)
+
+                action_description_prompt = """
+* `key`: Performs key down presses on the arguments passed in order, then performs key releases in reverse order.
+* `type`: Type a string of text on the keyboard.
+* `mouse_move`: Move the cursor to a specified (x, y) pixel coordinate on the screen.
+* `left_click`: Click the left mouse button at a specified (x, y) pixel coordinate on the screen.
+* `left_click_drag`: Click and drag the cursor to a specified (x, y) pixel coordinate on the screen.
+* `right_click`: Click the right mouse button at a specified (x, y) pixel coordinate on the screen.
+* `middle_click`: Click the middle mouse button at a specified (x, y) pixel coordinate on the screen.
+* `double_click`: Double-click the left mouse button at a specified (x, y) pixel coordinate on the screen.
+* `triple_click`: Triple-click the left mouse button at a specified (x, y) pixel coordinate on the screen (simulated as double-click since it's the closest action).
+* `scroll`: Performs a scroll of the mouse scroll wheel.
+* `hscroll`: Performs a horizontal scroll (mapped to regular scroll).
+* `wait`: Wait specified seconds for the change to happen.
+* `terminate`: Terminate the current task and report its completion status.
+* `answer`: Answer a question.
+        """
+
+                tools_def = {
+            "type": "function", 
+            "function": {
+                "name_for_human": "computer_use", 
+                "name": "computer_use", 
+                "description": description_prompt,
+                "parameters": {
+                    "properties": {
+                        "action": {
+                            "description": action_description_prompt,
+                            "enum": ["key", "type", "mouse_move", "left_click", "left_click_drag", 
+                                     "right_click", "middle_click", "double_click", "scroll", "wait", "terminate"], 
+                            "type": "string"
+                        },
+                        "keys": {"description": "Required only by `action=key`.", "type": "array"}, 
+                        "text": {"description": "Required only by `action=type`.", "type": "string"}, 
+                        "coordinate": {"description": "The x,y coordinates for mouse actions.", "type": "array"}, 
+                        "pixels": {"description": "The amount of scrolling.", "type": "number"}, 
+                        "time": {"description": "The seconds to wait.", "type": "number"}, 
+                        "status": {
+                            "description": "The status of the task.", 
+                            "type": "string", 
+                            "enum": ["success", "failure"]
+                        }
+                    }, 
+                    "required": ["action"], 
+                    "type": "object"
+                }, 
+                "args_format": "Format the arguments as a JSON object."
+            }
+        }
+
+                system_prompt = """# Tools
+
+You may call one or more functions to assist with the user query.
+
+You are provided with function signatures within <tools></tools> XML tags:
+<tools>
+""" + json.dumps(tools_def) + """
+</tools>
+
+For each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:
+<tool_call>
+{"name": <function-name>, "arguments": <args-json-object>}
+</tool_call>
+
+# Response format
+
+Response format for every step:
+1) Action: a short imperative describing what to do in the UI.
+2) A single <tool_call>...</tool_call> block containing only the JSON: {"name": <function-name>, "arguments": <args-json-object>}.
+
+Rules:
+- Output exactly in the order: Action, <tool_call>.
+- Be brief: one sentence for Action.
+- Do not output anything else outside those parts.
+- If finishing, use action=terminate in the tool call."""
 
             for item_values in zip(*(batch[k] for k in all_keys)):
                 item = {k: item_values[i] for i, k in enumerate(all_keys)}
@@ -375,6 +765,7 @@ class BCTrainer(BaseTrainer):
 
                 input_ids = []
                 labels = []
+                saw_first_human = False
 
                 # 对于 VL 模型，我们尝试从对话中解析 screenshot_base64，
                 # 将它解码成图像，后续交给 AutoProcessor 生成 pixel_values。
@@ -402,10 +793,21 @@ class BCTrainer(BaseTrainer):
 
                     # 文本 token 化逻辑保持原样，只是用 text_val 替代原始 value
                     if message["from"] == "human":
-                        text = f"<s>[INST] {text_val} [/INST]"
+                        if (not saw_first_human) and system_prompt:
+                            # LLaMA-style system prompt wrapper.
+                            text = (
+                                "<s>[INST] <<SYS>>\n"
+                                + system_prompt
+                                + "\n<</SYS>>\n\n"
+                                + str(text_val)
+                                + " [/INST]"
+                            )
+                        else:
+                            text = f"<s>[INST] {text_val} [/INST]"
                         input_encode = tok.encode(text, add_special_tokens=False)
                         input_ids.extend(input_encode)
                         labels.extend([-100] * len(input_encode))
+                        saw_first_human = True
                     else:
                         # message["from"] == "gpt":
                         # text = f" {message['value']}</s>"
@@ -812,6 +1214,39 @@ class BCTrainer(BaseTrainer):
         Initialize the training stuff, including the optimizer, scheduler, etc.
         Prepare the model, optimizer, and dataloader.
         """
+        # Optional: enable LoRA on vision modules (trainable adapters only) to reduce instability.
+        try:
+            use_vl_lora = bool(self.args.get("vision_lora", False))
+        except Exception:
+            use_vl_lora = False
+        if use_vl_lora:
+            try:
+                r = int(self.args.get("vision_lora_r", 8))
+                alpha = int(self.args.get("vision_lora_alpha", 16))
+                dropout = float(self.args.get("vision_lora_dropout", 0.0))
+                kw_raw = self.args.get("vision_lora_keywords", "vision,visual,image")
+                kws = [x.strip() for x in str(kw_raw).split(",") if x.strip()]
+                injected = inject_lora_into_linear_modules(
+                    self.agent.model,
+                    name_keywords=kws,
+                    r=r,
+                    alpha=alpha,
+                    dropout=dropout,
+                )
+                # Ensure only LoRA params in the vision branch remain trainable.
+                for n, p in self.agent.model.named_parameters():
+                    ln = n.lower()
+                    if any(k in ln for k in kws):
+                        if ".lora_" in ln:
+                            p.requires_grad = True
+                        else:
+                            p.requires_grad = False
+                self.accelerator.print(
+                    f"[LoRA] vision_lora enabled: injected_linear={injected} r={r} alpha={alpha} dropout={dropout} kws={kws}"
+                )
+            except Exception as e:
+                self.accelerator.print(f"[LoRA] vision_lora requested but failed to apply: {repr(e)}")
+
         num_training_steps = (
             len(self.train_dataloader)
             // self.accelerator.num_processes
@@ -828,6 +1263,7 @@ class BCTrainer(BaseTrainer):
                     p
                     for n, p in self.agent.model.named_parameters()
                     if not any(nd in n for nd in ["bias", "LayerNorm.weight"])
+                    and getattr(p, "requires_grad", False)
                 ],
                 "weight_decay": self.args["weight_decay"],
             },
@@ -836,6 +1272,7 @@ class BCTrainer(BaseTrainer):
                     p
                     for n, p in self.agent.model.named_parameters()
                     if any(nd in n for nd in ["bias", "LayerNorm.weight"])
+                    and getattr(p, "requires_grad", False)
                 ],
                 "weight_decay": 0.0,
             },
@@ -1208,6 +1645,205 @@ class QwenVLBCTrainer(BCTrainer):
     训练循环、优化器等逻辑沿用父类。
     """
 
+    def _maybe_apply_qwen_vision_lora(self) -> None:
+        """
+        Apply LoRA adapters only to the vision tower + vision connector/projector.
+
+        For qwen3-4b-vl-thinking, we want to adapt visual modules while keeping the LLM frozen.
+        We save full checkpoints; by default we merge LoRA into base weights on save for easy loading.
+        """
+        try:
+            enabled = bool(self.args.get("vision_lora", False))
+        except Exception:
+            enabled = False
+        if not enabled:
+            return
+
+        # Default LoRA hparams.
+        try:
+            r = int(self.args.get("vision_lora_r", 8))
+            alpha = int(self.args.get("vision_lora_alpha", 16))
+            dropout = float(self.args.get("vision_lora_dropout", 0.0))
+        except Exception:
+            r, alpha, dropout = 8, 16, 0.0
+
+        # Find vision-related root module paths.
+        # Allow override via args to keep this robust across HF model variants.
+        roots: list[str] = []
+        override = self.args.get("vision_lora_root_modules", None)
+        if override:
+            if isinstance(override, (list, tuple)):
+                roots = [str(x).strip() for x in override if str(x).strip()]
+            else:
+                roots = [x.strip() for x in str(override).split(",") if x.strip()]
+
+        if not roots:
+            candidates = [
+                # Common Qwen2/3-VL naming (under either model.* or top-level).
+                "visual",
+                "vision_tower",
+                "vision_model",
+                "vision_encoder",
+                "image_tower",
+                # Connector / projector / merger modules.
+                "mm_projector",
+                "visual_projection",
+                "image_projector",
+                "vision_projector",
+                "connector",
+                "merger",
+            ]
+            for c in candidates:
+                for p in (c, f"model.{c}"):
+                    try:
+                        self.agent.model.get_submodule(p)
+                        roots.append(p)
+                    except Exception:
+                        continue
+
+        roots = _shorten_module_roots(roots)
+        if not roots:
+            # Fallback: older heuristic based on name keywords (still avoids crashing).
+            kw_raw = self.args.get("vision_lora_keywords", "vision,visual,image,projector,connector,merger")
+            kws = [x.strip() for x in str(kw_raw).split(",") if x.strip()]
+            # Freeze everything first: only LoRA params will be trainable.
+            for p in self.agent.model.parameters():
+                p.requires_grad = False
+            injected = inject_lora_into_linear_modules(
+                self.agent.model,
+                name_keywords=kws,
+                r=r,
+                alpha=alpha,
+                dropout=dropout,
+            )
+            if injected <= 0:
+                raise RuntimeError(
+                    f"[LoRA][QwenVL] vision_lora enabled but injected_linear=0. "
+                    f"Try setting --vision_lora_root_modules or adjust --vision_lora_keywords (current={kws})."
+                )
+            for n, p in self.agent.model.named_parameters():
+                ln = n.lower()
+                if ".lora_" in ln:
+                    p.requires_grad = True
+            self.accelerator.print(
+                f"[LoRA][QwenVL] vision_lora enabled (fallback keywords): injected_linear={injected} r={r} alpha={alpha} dropout={dropout} kws={kws}"
+            )
+            return
+
+        # Freeze everything first: only LoRA params should be trainable.
+        for p in self.agent.model.parameters():
+            p.requires_grad = False
+
+        injected = inject_lora_into_linear_modules_in_subtrees(
+            self.agent.model,
+            root_module_paths=roots,
+            r=r,
+            alpha=alpha,
+            dropout=dropout,
+        )
+        if injected <= 0:
+            raise RuntimeError(
+                f"[LoRA][QwenVL] vision_lora enabled but injected_linear=0 for roots={roots}. "
+                f"Try setting --vision_lora_root_modules explicitly."
+            )
+
+        # Re-enable only LoRA parameters.
+        trainable = 0
+        total = 0
+        for n, p in self.agent.model.named_parameters():
+            total += p.numel()
+            if ".lora_" in n.lower():
+                p.requires_grad = True
+                trainable += p.numel()
+
+        self.accelerator.print(
+            f"[LoRA][QwenVL] vision_lora enabled: injected_linear={injected} r={r} alpha={alpha} dropout={dropout} roots={roots} trainable={trainable}/{total}"
+        )
+
+    def init_train_stuff(self):
+        # Apply vision-only LoRA before optimizer/scheduler creation.
+        self._maybe_apply_qwen_vision_lora()
+
+        # Prevent the base class from applying its generic keyword-based LoRA again.
+        had_key = "vision_lora" in self.args
+        saved = self.args.get("vision_lora", None)
+        self.args["vision_lora"] = False
+        try:
+            return super().init_train_stuff()
+        finally:
+            if had_key:
+                self.args["vision_lora"] = saved
+            else:
+                self.args.pop("vision_lora", None)
+
+    def save_model(self, model, tokenizer, save_path):
+        """
+        Save a full checkpoint that is loadable by the original HF Qwen-VL class.
+
+        If vision LoRA is enabled, we merge LoRA into base Linear weights and strip
+        LoRA wrapper keys from the saved state_dict. This keeps downstream loading
+        simple (no LoRA injection needed for inference/eval).
+        """
+        os.makedirs(save_path, exist_ok=True)
+
+        unwrapped_model = self.accelerator.unwrap_model(model)
+        try:
+            state_dict = None
+            use_ds = getattr(self.accelerator.state, "deepspeed_plugin", None) is not None
+            if use_ds and hasattr(self.accelerator, "get_state_dict"):
+                try:
+                    state_dict = self.accelerator.get_state_dict(model)
+                except AttributeError:
+                    state_dict = None
+            if state_dict is None:
+                state_dict = unwrapped_model.state_dict()
+
+            # Merge LoRA weights into the base weights for saving.
+            try:
+                merge_on_save = bool(self.args.get("vision_lora_merge_on_save", True))
+            except Exception:
+                merge_on_save = True
+            if merge_on_save and any(isinstance(k, str) and k.endswith(".lora_A") for k in state_dict.keys()):
+                try:
+                    r = int(self.args.get("vision_lora_r", 8))
+                    alpha = int(self.args.get("vision_lora_alpha", 16))
+                except Exception:
+                    r, alpha = 8, 16
+                state_dict = merge_and_strip_lora_from_state_dict(state_dict, r=r, alpha=alpha)
+
+            unwrapped_model.save_pretrained(
+                save_path,
+                is_main_process=self.accelerator.is_main_process,
+                save_function=self.accelerator.save,
+                state_dict=state_dict,
+            )
+        except ValueError:
+            if hasattr(model, "save_checkpoint"):
+                model.save_checkpoint(save_path)
+            else:
+                raise
+        tokenizer.save_pretrained(save_path)
+
+        # Keep processor/image processor config next to checkpoint for easy reload.
+        try:
+            base_model_path = os.path.abspath(os.path.expanduser(self.args.get("model_train_path", "")))
+            if base_model_path and os.path.isdir(base_model_path):
+                candidates = [
+                    "preprocessor_config.json",
+                    "processor_config.json",
+                    "image_processor",
+                    "image_processor.json",
+                ]
+                for name in candidates:
+                    src = os.path.join(base_model_path, name)
+                    dst = os.path.join(save_path, name)
+                    if os.path.isfile(src) and not os.path.exists(dst):
+                        shutil.copy2(src, dst)
+                    elif os.path.isdir(src) and not os.path.exists(dst):
+                        shutil.copytree(src, dst)
+        except Exception:
+            pass
+
     def get_train_dataloader(self):
         """
         为 Qwen-VL 构建 train_dataloader：
@@ -1222,6 +1858,96 @@ class QwenVLBCTrainer(BCTrainer):
 
         processor = self.processor
         args = self.args
+        # Qwen3-VL tool definitions and a minimal system prompt are shared across all samples.
+        # The dataset itself should only contain per-round user/assistant messages.
+        tools_for_template = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "computer_use",
+                    "description": (
+                        "Use a mouse and keyboard to interact with a computer, and take screenshots.\n"
+                        "* This is an interface to a desktop GUI. You do not have access to a terminal or applications menu. You must click on desktop icons to start applications.\n"
+                        "* Some applications may take time to start or process actions, so you may need to wait and take successive screenshots to see the results of your actions. E.g. if you click on Firefox and a window doesn't open, try wait and taking another screenshot.\n"
+                        "* The screen's resolution is 1000x1000.\n"
+                        "* Whenever you intend to move the cursor to click on an element like an icon, you should consult a screenshot to determine the coordinates of the element before moving the cursor.\n"
+                        "* If you tried clicking on a program or link but it failed to load even after waiting, try adjusting your cursor position so that the tip of the cursor visually falls on the element that you want to click.\n"
+                        "* Make sure to click any buttons, links, icons, etc with the cursor tip in the center of the element. Don't click boxes on their edges unless asked."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "action": {
+                                "description": (
+                                    "* `key`: Performs key down presses on the arguments passed in order, then performs key releases in reverse order.\n"
+                                    "* `type`: Type a string of text on the keyboard.\n"
+                                    "* `mouse_move`: Move the cursor to a specified (x, y) pixel coordinate on the screen.\n"
+                                    "* `left_click`: Click the left mouse button at a specified (x, y) pixel coordinate on the screen.\n"
+                                    "* `left_click_drag`: Click and drag the cursor to a specified (x, y) pixel coordinate on the screen.\n"
+                                    "* `right_click`: Click the right mouse button at a specified (x, y) pixel coordinate on the screen.\n"
+                                    "* `middle_click`: Click the middle mouse button at a specified (x, y) pixel coordinate on the screen.\n"
+                                    "* `double_click`: Double-click the left mouse button at a specified (x, y) pixel coordinate on the screen.\n"
+                                    "* `triple_click`: Triple-click the left mouse button at a specified (x, y) pixel coordinate on the screen (simulated as double-click since it's the closest action).\n"
+                                    "* `scroll`: Performs a scroll of the mouse scroll wheel.\n"
+                                    "* `hscroll`: Performs a horizontal scroll (mapped to regular scroll).\n"
+                                    "* `wait`: Wait specified seconds for the change to happen.\n"
+                                    "* `terminate`: Terminate the current task and report its completion status.\n"
+                                    "* `answer`: Answer a question."
+                                ),
+                                "enum": [
+                                    "key",
+                                    "type",
+                                    "mouse_move",
+                                    "left_click",
+                                    "left_click_drag",
+                                    "right_click",
+                                    "middle_click",
+                                    "double_click",
+                                    "scroll",
+                                    "wait",
+                                    "terminate",
+                                ],
+                                "type": "string",
+                            },
+                            "keys": {"description": "Required only by `action=key`.", "type": "array"},
+                            "text": {"description": "Required only by `action=type`.", "type": "string"},
+                            "coordinate": {"description": "The x,y coordinates for mouse actions.", "type": "array"},
+                            "pixels": {"description": "The amount of scrolling.", "type": "number"},
+                            "time": {"description": "The seconds to wait.", "type": "number"},
+                            "status": {
+                                "description": "The status of the task.",
+                                "type": "string",
+                                "enum": ["success", "failure"],
+                            },
+                        },
+                        "required": ["action"],
+                    },
+                },
+            }
+        ]
+
+        default_system_prompt = """# Response format
+
+Response format for every step:
+1) Action: a short imperative describing what to do in the UI.
+2) A single <tool_call>...</tool_call> block containing only the JSON: {"name": <function-name>, "arguments": <args-json-object>}.
+
+Rules:
+- Output exactly in the order: Action, <tool_call>.
+- Be brief: one sentence for Action.
+- Do not output anything else outside those parts.
+- If finishing, use action=terminate in the tool call.""".strip()
+        # Optional system prompt (recommended for Qwen-VL via role="system").
+        try:
+            system_prompt = (
+                args.get("system_prompt")
+                or os.environ.get("AGENTGYM_SYSTEM_PROMPT", "")
+            )
+            system_prompt = str(system_prompt).strip()
+        except Exception:
+            system_prompt = ""
+        if not system_prompt:
+            system_prompt = default_system_prompt
         # 官方推荐由 tokenizer 提供 chat_template；AutoProcessor 通常把 tokenizer 挂在其 tokenizer 属性下
         tok_for_template = getattr(processor, "tokenizer", processor)
 
@@ -1274,8 +2000,15 @@ class QwenVLBCTrainer(BCTrainer):
         except Exception:
             train_file_dir = None
 
-        prev_image_rounds = int(args.get("vl_prev_image_rounds", 4) or 4)
-        prev_downsample = float(args.get("vl_prev_downsample", 0.5) or 0.5)
+        # Align with OSWorld/mm_agents/qwen3vl_agent.py:
+        # keep only the most recent `history_n` previous rounds + the current round.
+        # (In the OSWorld agent, history_n counts *previous* steps; current screenshot is appended separately.)
+        try:
+            history_n = int(os.environ.get("AGENTGYM_QWENVL_HISTORY_N", str(args.get("history_n", 4) or 4)))
+        except Exception:
+            history_n = int(args.get("history_n", 4) or 4)
+        if history_n < 0:
+            history_n = 0
 
         def _resolve_img_path(p: str) -> str:
             if not p:
@@ -1444,7 +2177,7 @@ class QwenVLBCTrainer(BCTrainer):
 
         def build_qwen_vl_conversation(item):
             """
-            将单条样本的 conversations 转成 Qwen-VL chat template 期望的格式：
+            将单条样本转成 Qwen-VL chat template 期望的格式：
             [
               {
                 "role": "user" | "assistant",
@@ -1457,25 +2190,143 @@ class QwenVLBCTrainer(BCTrainer):
               ...
             ]
             """
-            conversations = item["conversations"]
             proc_messages = []
             images_for_conv = []
+
+            # New dataset format: item["messages"] already has role/content/tool_calls/reasoning_content,
+            # with user image items storing image paths. We load images here and keep only a history window.
+            messages_all = item.get("messages", None)
+            if isinstance(messages_all, list) and messages_all:
+                try:
+                    k_round = int(item.get("round_idx") or 0)
+                except Exception:
+                    k_round = 0
+                if k_round <= 0:
+                    k_round = max(1, int(len(messages_all) // 2)) if messages_all else 0
+
+                start_round = 1
+                if k_round > 0:
+                    start_round = max(1, k_round - int(history_n))
+
+                start_msg_index = max(0, (start_round - 1) * 2)
+                end_msg_index = min(len(messages_all), max(0, k_round * 2)) if k_round > 0 else len(messages_all)
+                if end_msg_index <= 0:
+                    end_msg_index = len(messages_all)
+                if start_msg_index >= end_msg_index:
+                    start_msg_index = 0
+
+                messages = messages_all[start_msg_index:end_msg_index]
+
+                for msg in messages:
+                    if not isinstance(msg, dict):
+                        continue
+                    role = msg.get("role")
+                    raw_content = msg.get("content")
+                    content_parts = []
+
+                    if role == "user":
+                        # Expect list[{"type":"image","image":path}|{"type":"text","text":...}]
+                        if isinstance(raw_content, list):
+                            for part in raw_content:
+                                if not isinstance(part, dict):
+                                    continue
+                                if part.get("type") == "image":
+                                    p = part.get("image")
+                                    if isinstance(p, str) and p:
+                                        img = _load_pil_image(p, factor=1.0)
+                                        if img is not None:
+                                            content_parts.append({"type": "image", "image": img})
+                                            images_for_conv.append(img)
+                                elif part.get("type") == "text":
+                                    t = part.get("text")
+                                    if t is not None:
+                                        content_parts.append({"type": "text", "text": str(t)})
+                        else:
+                            # Fallback: treat as plain text.
+                            if raw_content is not None:
+                                content_parts.append({"type": "text", "text": str(raw_content)})
+
+                        if not any(isinstance(p, dict) and p.get("type") == "text" for p in content_parts):
+                            content_parts.append({"type": "text", "text": ""})
+
+                        proc_messages.append({"role": "user", "content": content_parts})
+
+                    elif role == "assistant":
+                        # Keep assistant as text; tool_calls/reasoning_content go on the message object.
+                        if isinstance(raw_content, list):
+                            # After dataset normalization, assistant content may be a list of blocks.
+                            parts = []
+                            for part in raw_content:
+                                if not isinstance(part, dict):
+                                    continue
+                                if part.get("type") == "text":
+                                    t = part.get("text")
+                                    if t is not None:
+                                        parts.append(str(t))
+                            raw_content = "\n".join([p for p in parts if str(p).strip()]).strip()
+                        elif raw_content is None:
+                            raw_content = ""
+                        content_parts.append({"type": "text", "text": str(raw_content)})
+
+                        out = {"role": "assistant", "content": content_parts}
+                        rc = msg.get("reasoning_content")
+                        if isinstance(rc, str) and rc.strip():
+                            out["reasoning_content"] = rc
+                        tc = msg.get("tool_calls")
+                        if isinstance(tc, list) and tc:
+                            out["tool_calls"] = tc
+                        proc_messages.append(out)
+
+                if system_prompt:
+                    proc_messages = [
+                        {"role": "system", "content": [{"type": "text", "text": system_prompt}]}
+                    ] + proc_messages
+
+                return proc_messages, images_for_conv
+
+            # Legacy dataset format: build from item["conversations"] + item["images"].
+            conversations_all = item["conversations"]
 
             # Preferred: merged dataset provides `images` as per-round image path arrays.
             # Fallback: legacy path parses base64 from message["value"].
             images_by_round = item.get("images", None)
             has_image_paths = isinstance(images_by_round, list)
+            # Only keep the last `history_n` previous rounds + current round (OSWorld-style window).
+            # Rounds are assumed to be (human, gpt) pairs: round_r = msg_index//2 + 1
             try:
                 k_round = int(item.get("round_idx") or 0)
             except Exception:
                 k_round = 0
+            # If round_idx is missing, fall back to available rounds in the sample.
+            if k_round <= 0:
+                try:
+                    k_round = int(len(conversations_all) // 2)
+                except Exception:
+                    k_round = 0
             if k_round <= 0 and has_image_paths:
                 try:
                     k_round = int(len(images_by_round))
                 except Exception:
                     k_round = 0
+            if k_round <= 0:
+                k_round = max(1, int(len(conversations_all) // 2)) if conversations_all else 0
 
-            for msg_index, message in enumerate(conversations):
+            start_round = 1
+            if k_round > 0:
+                start_round = max(1, k_round - int(history_n))
+
+            start_msg_index = max(0, (start_round - 1) * 2)
+            end_msg_index = min(len(conversations_all), max(0, k_round * 2)) if k_round > 0 else len(conversations_all)
+            if end_msg_index <= 0:
+                end_msg_index = len(conversations_all)
+            if start_msg_index >= end_msg_index:
+                start_msg_index = 0
+
+            conversations = conversations_all[start_msg_index:end_msg_index]
+
+            for local_idx, message in enumerate(conversations):
+                # Keep original message index for round/image alignment.
+                msg_index = start_msg_index + local_idx
                 raw_val = message["value"]
                 text_val = raw_val
                 screenshot_b64 = None
@@ -1522,10 +2373,9 @@ class QwenVLBCTrainer(BCTrainer):
 
                 content_parts = []
 
-                # Attach images:
-                # - current round (k): full resolution
-                # - previous `prev_image_rounds`: downsampled
-                # - earlier: no images
+                # Attach images (OSWorld-style window):
+                # - keep only rounds in [start_round, k_round] (previous history_n + current)
+                # - always use full-resolution images (no manual downsample here)
                 # If the merged dataset provides image paths, use them; otherwise fallback to base64.
                 if has_image_paths and k_round > 0:
                     round_r = (msg_index // 2) + 1  # 1-based round index
@@ -1538,10 +2388,8 @@ class QwenVLBCTrainer(BCTrainer):
                         round_r = None  # mark as no-image
                         factor = 0.0
                     else:
-                        if round_r == k_round:
+                        if start_round <= round_r <= k_round:
                             factor = 1.0
-                        elif (k_round - prev_image_rounds) <= round_r < k_round:
-                            factor = prev_downsample
                         else:
                             factor = 0.0
 
@@ -1593,6 +2441,15 @@ class QwenVLBCTrainer(BCTrainer):
                 role = "user" if message["from"] == "human" else "assistant"
                 proc_messages.append({"role": role, "content": content_parts})
 
+            # Prepend system prompt so chat template can place it in the system segment.
+            if system_prompt:
+                proc_messages = [
+                    {
+                        "role": "system",
+                        "content": [{"type": "text", "text": system_prompt}],
+                    }
+                ] + proc_messages
+
             return proc_messages, images_for_conv
 
         def collate_fn(batch):
@@ -1614,6 +2471,7 @@ class QwenVLBCTrainer(BCTrainer):
                         messages,
                         add_generation_prompt=False,
                         tokenize=False,
+                        tools=tools_for_template,
                     )
                 except Exception:
                     text = None

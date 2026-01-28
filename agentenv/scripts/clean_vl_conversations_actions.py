@@ -9,7 +9,7 @@ Why:
   - A tiny fraction of samples may contain corrupted/partial Action lines, which can
     hurt supervised training (the model learns to emit unparsable actions).
 
-This script streams a large JSON array and either:
+This script streams a large JSON array (or a JSONL file of dicts) and either:
   - marks bad assistant turns as loss=False (default, safest), or
   - attempts a best-effort repair for simple broken start_box patterns.
 """
@@ -21,7 +21,7 @@ import ast
 import json
 import re
 from pathlib import Path
-from typing import Any, Dict, Generator, Optional, Tuple
+from typing import Any, Dict, Generator, Iterable, Optional, Tuple
 
 
 def iter_json_array(path: Path, *, chunk_size: int = 8 * 1024 * 1024) -> Generator[dict, None, None]:
@@ -74,6 +74,40 @@ def iter_json_array(path: Path, *, chunk_size: int = 8 * 1024 * 1024) -> Generat
                 else:
                     yield {"_non_dict_item": obj}
                 break
+
+
+def iter_jsonl(path: Path) -> Generator[dict, None, None]:
+    with path.open("r", encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except Exception:
+                continue
+            if isinstance(obj, dict):
+                yield obj
+            else:
+                yield {"_non_dict_item": obj}
+
+
+def detect_input_format(path: Path, *, hint: str = "auto") -> str:
+    if hint in {"json", "jsonl"}:
+        return hint
+    # Extension hint
+    if path.suffix.lower() == ".jsonl":
+        return "jsonl"
+    # Content hint
+    with path.open("r", encoding="utf-8", errors="ignore") as f:
+        while True:
+            ch = f.read(1)
+            if not ch:
+                break
+            if ch.isspace():
+                continue
+            return "json" if ch == "[" else "jsonl"
+    return "jsonl"
 
 
 def extract_action_line(text: Any) -> Optional[str]:
@@ -133,7 +167,7 @@ def try_repair_action(line: str) -> Optional[str]:
     return None
 
 
-def write_json_array(path: Path, items: Generator[dict, None, None]) -> None:
+def write_json_array(path: Path, items: Iterable[dict]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     first = True
     with path.open("w", encoding="utf-8") as f:
@@ -146,10 +180,29 @@ def write_json_array(path: Path, items: Generator[dict, None, None]) -> None:
         f.write("\n]\n")
 
 
+def write_jsonl(path: Path, items: Iterable[dict]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as f:
+        for item in items:
+            f.write(json.dumps(item, ensure_ascii=False) + "\n")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--input", required=True)
     ap.add_argument("--output", required=True)
+    ap.add_argument(
+        "--input_format",
+        choices=["auto", "json", "jsonl"],
+        default="auto",
+        help="Input format: json (a single large list) or jsonl (one dict per line).",
+    )
+    ap.add_argument(
+        "--output_format",
+        choices=["auto", "json", "jsonl"],
+        default="auto",
+        help="Output format. Default auto uses output suffix (.jsonl => jsonl, else json).",
+    )
     ap.add_argument(
         "--mode",
         choices=["mark_loss_false", "repair_or_mark_loss_false"],
@@ -161,14 +214,19 @@ def main() -> int:
     in_path = Path(args.input)
     out_path = Path(args.output)
 
+    input_fmt = detect_input_format(in_path, hint=args.input_format)
+    output_fmt = args.output_format
+    if output_fmt == "auto":
+        output_fmt = "jsonl" if out_path.suffix.lower() == ".jsonl" else "json"
+
     total_items = 0
     total_loss_true_msgs = 0
     bad_msgs = 0
     repaired_msgs = 0
 
-    def cleaned_items() -> Generator[dict, None, None]:
+    def cleaned_items(items: Iterable[dict]) -> Generator[dict, None, None]:
         nonlocal total_items, total_loss_true_msgs, bad_msgs, repaired_msgs
-        for item in iter_json_array(in_path):
+        for item in items:
             total_items += 1
             convs = item.get("conversations")
             if isinstance(convs, list):
@@ -195,13 +253,23 @@ def main() -> int:
                         m["loss"] = False
             yield item
 
-    write_json_array(out_path, cleaned_items())
+    if input_fmt == "json":
+        src_items: Iterable[dict] = iter_json_array(in_path)
+    else:
+        src_items = iter_jsonl(in_path)
+
+    if output_fmt == "json":
+        write_json_array(out_path, cleaned_items(src_items))
+    else:
+        write_jsonl(out_path, cleaned_items(src_items))
 
     print(
         json.dumps(
             {
                 "input": str(in_path),
                 "output": str(out_path),
+                "input_format": input_fmt,
+                "output_format": output_fmt,
                 "items": total_items,
                 "assistant_loss_true_msgs": total_loss_true_msgs,
                 "bad_msgs": bad_msgs,

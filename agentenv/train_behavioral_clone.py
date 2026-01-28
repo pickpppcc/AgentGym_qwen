@@ -162,6 +162,32 @@ class TrainingArguments:
         },
     )
 
+    # LoRA for vision branch (applied inside BCTrainer/QwenVLBCTrainer before optimizer creation).
+    vision_lora: bool = field(
+        default=False,
+        metadata={"help": "Enable LoRA adapters on vision modules (freeze base vision weights)."},
+    )
+    vision_lora_r: int = field(default=8, metadata={"help": "LoRA rank for vision modules."})
+    vision_lora_alpha: int = field(default=16, metadata={"help": "LoRA alpha for vision modules."})
+    vision_lora_dropout: float = field(default=0.0, metadata={"help": "LoRA dropout for vision modules."})
+    vision_lora_keywords: str = field(
+        default="vision,visual,image",
+        metadata={"help": "Comma-separated keywords; module names containing any will be LoRA-wrapped."},
+    )
+    vision_lora_root_modules: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "Optional comma-separated root module paths to LoRA-wrap (e.g. 'model.visual,model.mm_projector'). "
+            "When set, LoRA is applied only under these subtrees."
+        },
+    )
+    vision_lora_merge_on_save: bool = field(
+        default=True,
+        metadata={
+            "help": "If True, merge vision LoRA into base weights when saving checkpoints (checkpoint loads without LoRA wrappers)."
+        },
+    )
+
 
 def main():
     parser = transformers.HfArgumentParser(TrainingArguments)
