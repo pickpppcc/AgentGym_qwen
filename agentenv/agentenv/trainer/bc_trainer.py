@@ -2274,8 +2274,44 @@ Rules:
                             out["reasoning_content"] = rc
                         tc = msg.get("tool_calls")
                         if isinstance(tc, list) and tc:
-                            out["tool_calls"] = tc
+                            # Be tolerant to multiple tool_call schemas:
+                            # - {"name": "...", "arguments": {...|str}}
+                            # - {"type":"function","function":{"name":...,"arguments":...}}
+                            norm_tc = []
+                            for call in tc:
+                                if not isinstance(call, dict):
+                                    continue
+                                if isinstance(call.get("function"), dict):
+                                    norm_tc.append(call)
+                                    continue
+                                if "name" in call and "arguments" in call:
+                                    norm_tc.append(call)
+                                    continue
+                            if norm_tc:
+                                out["tool_calls"] = norm_tc
                         proc_messages.append(out)
+                    elif role == "tool":
+                        # Support tool responses in the dataset (role="tool"), so Qwen3 chat_template
+                        # can render <tool_response> blocks.
+                        tool_text = ""
+                        if isinstance(raw_content, list):
+                            parts = []
+                            for part in raw_content:
+                                if isinstance(part, dict) and part.get("type") == "text":
+                                    t = part.get("text")
+                                    if t is not None:
+                                        parts.append(str(t))
+                            tool_text = "\n".join([p for p in parts if str(p).strip()]).strip()
+                        elif isinstance(raw_content, str):
+                            tool_text = raw_content
+                        elif raw_content is None:
+                            tool_text = ""
+                        else:
+                            tool_text = str(raw_content)
+
+                        proc_messages.append(
+                            {"role": "tool", "content": [{"type": "text", "text": tool_text}]}
+                        )
 
                 if system_prompt:
                     proc_messages = [
