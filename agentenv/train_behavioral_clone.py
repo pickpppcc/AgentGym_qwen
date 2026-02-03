@@ -1,8 +1,9 @@
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, Tuple
 from pathlib import Path
 import json
 import os
+import re
 
 import torch
 import transformers
@@ -188,10 +189,131 @@ class TrainingArguments:
         },
     )
 
+    # LoRA for text/LLM branch.
+    text_lora: bool = field(
+        default=False,
+        metadata={"help": "Enable LoRA adapters on text/LLM modules (freeze base weights; train adapters only)."},
+    )
+    text_lora_r: int = field(default=8, metadata={"help": "LoRA rank for text/LLM modules."})
+    text_lora_alpha: int = field(default=16, metadata={"help": "LoRA alpha for text/LLM modules."})
+    text_lora_dropout: float = field(default=0.0, metadata={"help": "LoRA dropout for text/LLM modules."})
+    text_lora_keywords: str = field(
+        default="q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj,c_attn,c_proj,c_fc",
+        metadata={"help": "Comma-separated keywords; module names containing any will be LoRA-wrapped."},
+    )
+    text_lora_root_modules: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "Optional comma-separated root module paths to LoRA-wrap (e.g. 'model' or 'model.model'). "
+            "When set, LoRA is applied only under these subtrees."
+        },
+    )
+    text_lora_train_bias: str = field(
+        default="none",
+        metadata={"help": "LoRA bias training mode: 'none' or 'all'."},
+    )
+    text_lora_merge_on_save: bool = field(
+        default=True,
+        metadata={
+            "help": "If True, merge text LoRA into base weights when saving checkpoints (checkpoint loads without LoRA wrappers)."
+        },
+    )
+    resume_from_checkpoint: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "Resume training from a previous checkpoint directory. Supports:\n"
+            "  - a checkpoint dir like /path/to/.../train_epoch_123\n"
+            "  - a run dir that contains train_epoch_* subdirs (will pick the latest)\n"
+            "  - 'latest' (uses --model_save_path and picks the latest train_epoch_*)\n"
+            "When set, --model_train_path will be overridden to point to the resolved checkpoint."
+        },
+    )
+    resume_epoch: int = field(
+        default=0,
+        metadata={
+            "help": "Internal (auto-filled): epoch number of the resume checkpoint (0 means no resume)."
+        },
+    )
+
+
+def _resolve_latest_train_epoch_ckpt(run_dir: str) -> Tuple[Optional[str], int]:
+    """
+    Return (ckpt_dir, epoch) for the latest train_epoch_* checkpoint under run_dir.
+    """
+    if not run_dir:
+        return None, 0
+    run_dir = os.path.abspath(os.path.expanduser(str(run_dir)))
+    if not os.path.isdir(run_dir):
+        return None, 0
+    best_epoch = 0
+    best_path: Optional[str] = None
+    try:
+        for name in os.listdir(run_dir):
+            m = re.match(r"^train_epoch_(\d+)$", name)
+            if not m:
+                continue
+            ep = int(m.group(1))
+            p = os.path.join(run_dir, name)
+            if not os.path.isdir(p):
+                continue
+            if ep > best_epoch:
+                best_epoch = ep
+                best_path = p
+    except Exception:
+        return None, 0
+    return best_path, best_epoch
+
+
+def _resolve_resume_checkpoint(resume_from: str, model_save_path: str) -> Tuple[str, int]:
+    """
+    Resolve user-provided resume_from_checkpoint into a concrete checkpoint directory.
+    """
+    if resume_from is None:
+        raise ValueError("resume_from_checkpoint is None")
+    s = str(resume_from).strip()
+    if not s:
+        raise ValueError("resume_from_checkpoint is empty")
+
+    if s.lower() == "latest":
+        ckpt, ep = _resolve_latest_train_epoch_ckpt(model_save_path)
+        if ckpt is None:
+            raise FileNotFoundError(
+                f"resume_from_checkpoint='latest' but no train_epoch_* found under model_save_path={model_save_path}"
+            )
+        return ckpt, ep
+
+    p = os.path.abspath(os.path.expanduser(s))
+    if not os.path.isdir(p):
+        raise FileNotFoundError(f"resume_from_checkpoint path not found: {p}")
+
+    m = re.match(r"^train_epoch_(\d+)$", os.path.basename(p))
+    if m:
+        return p, int(m.group(1))
+
+    # If user points to a run dir, pick the latest train_epoch_* inside.
+    ckpt, ep = _resolve_latest_train_epoch_ckpt(p)
+    if ckpt is None:
+        raise FileNotFoundError(f"No train_epoch_* checkpoints found under: {p}")
+    return ckpt, ep
+
 
 def main():
     parser = transformers.HfArgumentParser(TrainingArguments)
     (args,) = parser.parse_args_into_dataclasses()
+
+    # Resolve resume checkpoint early (before loading model/tokenizer/processor).
+    if args.resume_from_checkpoint:
+        ckpt_dir, ckpt_epoch = _resolve_resume_checkpoint(
+            args.resume_from_checkpoint, args.model_save_path
+        )
+        args.model_train_path = ckpt_dir
+        args.resume_epoch = int(ckpt_epoch)
+        try:
+            rank = int(os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0")))
+        except Exception:
+            rank = 0
+        if rank == 0:
+            print(f"[Resume] model_train_path <- {ckpt_dir} (epoch={ckpt_epoch})")
 
     # 根据路径与 config.json 识别是否为视觉语言模型（Qwen2-VL / Qwen3-VL 等）
     model_path_lower = args.model_train_path.lower()

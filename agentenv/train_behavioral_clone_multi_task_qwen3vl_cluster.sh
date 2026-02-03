@@ -44,6 +44,17 @@ fi
 main_process_port="${MAIN_PROCESS_PORT:-8897}"
 mixed_precision="${MIXED_PRECISION:-bf16}"
 
+# ---- Optional resume ----
+# Usage:
+#   RESUME_FROM_CHECKPOINT="latest" bash .../train_behavioral_clone_multi_task_qwen3vl_cluster.sh
+#   RESUME_FROM_CHECKPOINT="/path/to/outputs/train_epoch_123" bash ...
+#   RESUME_FROM_CHECKPOINT="/path/to/outputs" bash ...   # auto-pick latest train_epoch_*
+resume_from_checkpoint="${RESUME_FROM_CHECKPOINT:-}"
+resume_args=()
+if [ -n "${resume_from_checkpoint}" ]; then
+  resume_args+=(--resume_from_checkpoint "${resume_from_checkpoint}")
+fi
+
 # ---- Args (cluster paths; keep as-is) ----
 train_file="/dfs/data/AgentGym_qwen/data/processed_conversations_vl_train.json"
 inference_file="/dfs/data/AgentGym_qwen/data/processed_conversations_vl_validation.json"
@@ -106,4 +117,5 @@ accelerate launch \
   --train_max_samples "20000" \
   --debug "true" \
   --debug_max_tokens "512" \
-  --assistant_only_loss "true"
+  --assistant_only_loss "true" \
+  "${resume_args[@]}"

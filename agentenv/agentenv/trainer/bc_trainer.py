@@ -2,6 +2,7 @@ import json
 import shutil
 import os
 import re
+import math
 from datetime import datetime
 from collections import defaultdict
 from dataclasses import asdict
@@ -56,6 +57,13 @@ class LoRALinear(nn.Module):
         self.alpha = int(alpha)
         self.scaling = float(alpha) / float(r)
         self.dropout = nn.Dropout(float(dropout)) if float(dropout) > 0 else nn.Identity()
+        # Persist scaling so we can reliably merge LoRA into base weights on save,
+        # even when different subtrees use different (r, alpha) hyperparameters.
+        self.register_buffer(
+            "lora_scaling",
+            torch.tensor(self.scaling, dtype=torch.float32),
+            persistent=True,
+        )
 
         # Freeze base params
         self.base.weight.requires_grad = False
@@ -179,8 +187,10 @@ def _shorten_module_roots(paths: Sequence[str]) -> list[str]:
 def merge_and_strip_lora_from_state_dict(
     state_dict: dict,
     *,
-    r: int,
-    alpha: int,
+    # Back-compat: if older checkpoints do not store per-module scaling buffers,
+    # fall back to alpha/r passed in by the caller.
+    r: int = 8,
+    alpha: int = 16,
 ) -> dict:
     """
     Convert a LoRALinear-wrapped state_dict into a plain nn.Linear-compatible one by:
@@ -195,9 +205,9 @@ def merge_and_strip_lora_from_state_dict(
         return state_dict
 
     try:
-        scaling = float(alpha) / float(r)
+        default_scaling = float(alpha) / float(r)
     except Exception:
-        scaling = 1.0
+        default_scaling = 1.0
 
     # Work on a shallow copy; tensors are re-used unless explicitly replaced.
     out = dict(state_dict)
@@ -205,6 +215,7 @@ def merge_and_strip_lora_from_state_dict(
     # Find all LoRA blocks by `.lora_A` keys.
     lora_A_suffix = ".lora_A"
     lora_B_suffix = ".lora_B"
+    lora_scaling_suffix = ".lora_scaling"
     base_w_suffix = ".base.weight"
     base_b_suffix = ".base.bias"
 
@@ -214,6 +225,7 @@ def merge_and_strip_lora_from_state_dict(
         prefix = k[: -len(lora_A_suffix)]
         kA = prefix + lora_A_suffix
         kB = prefix + lora_B_suffix
+        kS = prefix + lora_scaling_suffix
         kW = prefix + base_w_suffix
         kBias = prefix + base_b_suffix
 
@@ -225,6 +237,13 @@ def merge_and_strip_lora_from_state_dict(
         W = state_dict[kW]
 
         try:
+            scaling = default_scaling
+            if kS in state_dict:
+                # Stored as a buffer tensor.
+                try:
+                    scaling = float(state_dict[kS].item())
+                except Exception:
+                    scaling = default_scaling
             # Merge in fp32 on CPU for numerical stability, then cast back.
             # Shapes:
             #   W: [out, in], A: [r, in], B: [out, r]
@@ -240,7 +259,7 @@ def merge_and_strip_lora_from_state_dict(
             out[prefix + ".bias"] = state_dict[kBias]
 
         # Drop LoRA wrapper-specific keys.
-        for kk in (kA, kB, kW, kBias):
+        for kk in (kA, kB, kS, kW, kBias):
             out.pop(kk, None)
 
     return out
@@ -1137,6 +1156,26 @@ Rules:
                 except AttributeError:
                     # 如果传入的是已解包的 HF 模型则跳过聚合，走常规保存
                     state_dict = None
+            # For non-DeepSpeed (or when aggregation is unavailable), take the local state_dict
+            # so we can optionally merge LoRA wrappers into base weights.
+            if state_dict is None and not use_ds:
+                state_dict = unwrapped_model.state_dict()
+            # If any LoRA wrappers are present, optionally merge them into base weights
+            # so the checkpoint is loadable by the original HF model class.
+            if state_dict is not None and any(
+                isinstance(k, str) and k.endswith(".lora_A") for k in state_dict.keys()
+            ):
+                try:
+                    merge_text = bool(self.args.get("text_lora_merge_on_save", True))
+                except Exception:
+                    merge_text = True
+                try:
+                    merge_vision = bool(self.args.get("vision_lora_merge_on_save", True))
+                except Exception:
+                    merge_vision = True
+                if merge_text or merge_vision:
+                    state_dict = merge_and_strip_lora_from_state_dict(state_dict)
+
             unwrapped_model.save_pretrained(
                 save_path,
                 is_main_process=self.accelerator.is_main_process,
@@ -1214,6 +1253,9 @@ Rules:
         Initialize the training stuff, including the optimizer, scheduler, etc.
         Prepare the model, optimizer, and dataloader.
         """
+        # Optional: enable LoRA on text/LLM modules (trainable adapters only).
+        self._maybe_apply_text_lora()
+
         # Optional: enable LoRA on vision modules (trainable adapters only) to reduce instability.
         try:
             use_vl_lora = bool(self.args.get("vision_lora", False))
@@ -1328,6 +1370,96 @@ Rules:
             self.test_dataloader,
         )
 
+    def _maybe_apply_text_lora(self) -> None:
+        """
+        Apply LoRA adapters on the language/text branch.
+
+        This is primarily for reducing train-time memory/instability by freezing base
+        weights and training only LoRA params (and optionally biases).
+
+        Args are read from self.args:
+          - text_lora (bool): enable/disable
+          - text_lora_r / text_lora_alpha / text_lora_dropout
+          - text_lora_keywords (comma-separated)
+          - text_lora_root_modules (optional comma-separated module roots)
+          - text_lora_train_bias: "none" | "all"
+        """
+        try:
+            enabled = bool(self.args.get("text_lora", False))
+        except Exception:
+            enabled = False
+        if not enabled:
+            return
+
+        try:
+            r = int(self.args.get("text_lora_r", 8))
+            alpha = int(self.args.get("text_lora_alpha", 16))
+            dropout = float(self.args.get("text_lora_dropout", 0.0))
+        except Exception:
+            r, alpha, dropout = 8, 16, 0.0
+
+        bias_mode = str(self.args.get("text_lora_train_bias", "none") or "none").strip().lower()
+        if bias_mode not in ("none", "all"):
+            bias_mode = "none"
+
+        # Freeze everything first: only LoRA params (and optional biases) will be trainable.
+        for p in self.agent.model.parameters():
+            p.requires_grad = False
+
+        injected = 0
+        roots_raw = self.args.get("text_lora_root_modules", None)
+        if roots_raw:
+            roots = _shorten_module_roots([x.strip() for x in str(roots_raw).split(",") if x.strip()])
+            injected = inject_lora_into_linear_modules_in_subtrees(
+                self.agent.model,
+                root_module_paths=roots,
+                r=r,
+                alpha=alpha,
+                dropout=dropout,
+            )
+            if injected <= 0:
+                self.accelerator.print(
+                    f"[LoRA][Text] text_lora enabled but injected_linear=0 for roots={roots}. "
+                    f"Try adjusting --text_lora_root_modules."
+                )
+        else:
+            kw_raw = self.args.get(
+                "text_lora_keywords",
+                # Common HF LLM module names (LLaMA/Qwen/Mistral/GPT-style fallbacks).
+                "q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj,c_attn,c_proj,c_fc",
+            )
+            kws = [x.strip() for x in str(kw_raw).split(",") if x.strip()]
+            injected = inject_lora_into_linear_modules(
+                self.agent.model,
+                name_keywords=kws,
+                r=r,
+                alpha=alpha,
+                dropout=dropout,
+            )
+            if injected <= 0:
+                self.accelerator.print(
+                    f"[LoRA][Text] text_lora enabled but injected_linear=0 for keywords={kws}. "
+                    f"Try setting --text_lora_keywords or --text_lora_root_modules."
+                )
+
+        # Re-enable only LoRA parameters (+ optional biases).
+        trainable = 0
+        total = 0
+        for n, p in self.agent.model.named_parameters():
+            total += p.numel()
+            ln = n.lower()
+            if ".lora_" in ln:
+                p.requires_grad = True
+                trainable += p.numel()
+            elif bias_mode == "all" and ln.endswith(".bias"):
+                p.requires_grad = True
+                trainable += p.numel()
+
+        self.accelerator.print(
+            f"[LoRA][Text] text_lora enabled: injected_linear={injected} r={r} alpha={alpha} "
+            f"dropout={dropout} train_bias={bias_mode} trainable={trainable}/{total}"
+        )
+
     def train_one_epoch(self, epoch, global_step):
         clip_grad_norm = self.args.get("clip_grad_norm", None)
         logging_step_freq = self.args.get("logging_step_freq", None)
@@ -1421,6 +1553,13 @@ Rules:
         Train the model.
         """
         global_step = 0
+        start_epoch = 1
+        resume_epoch = 0
+        try:
+            resume_epoch = int(self.args.get("resume_epoch", 0) or 0)
+        except Exception:
+            resume_epoch = 0
+
         n_epochs = self.args["n_epochs"]
         logging_epoch_freq = self.args["logging_epoch_freq"]
         evaluating_epoch_freq = self.args["evaluating_epoch_freq"]
@@ -1437,7 +1576,48 @@ Rules:
         save_total_limit = self.args.get("save_total_limit", None)
         if save_latest_only:
             save_total_limit = 1
-        with tqdm(range(1, n_epochs + 1), total=n_epochs, disable=False) as t:
+
+        # Resume: keep epoch numbering continuous, and best-effort align the LR scheduler
+        # to the resumed global_step (optimizer state is NOT restored here).
+        if resume_epoch > 0:
+            start_epoch = resume_epoch + 1
+            try:
+                grad_acc = max(1, int(self.args.get("gradient_accumulation_steps", 1) or 1))
+            except Exception:
+                grad_acc = 1
+            try:
+                steps_per_epoch = int(math.ceil(float(len(self.train_dataloader)) / float(grad_acc)))
+            except Exception:
+                steps_per_epoch = 0
+            global_step = int(resume_epoch * max(0, steps_per_epoch))
+
+            # Align scheduler to the resumed step so the next scheduler.step() matches the continuation.
+            if global_step > 0 and hasattr(self, "scheduler") and self.scheduler is not None:
+                if type(self.scheduler).__name__ != "DummyScheduler":
+                    try:
+                        # Avoid calling scheduler.step() before optimizer.step() (PyTorch warning).
+                        # We set last_epoch and update optimizer lrs directly.
+                        if hasattr(self.scheduler, "last_epoch"):
+                            self.scheduler.last_epoch = int(global_step - 1)
+                        if hasattr(self.scheduler, "get_lr") and self.optimizer is not None:
+                            lrs = list(self.scheduler.get_lr())
+                            for pg, lr in zip(self.optimizer.param_groups, lrs):
+                                pg["lr"] = float(lr)
+                            if hasattr(self.scheduler, "_last_lr"):
+                                self.scheduler._last_lr = lrs
+                    except Exception:
+                        pass
+            self._log_line(f"[resume] resume_epoch={resume_epoch} start_epoch={start_epoch} global_step~={global_step}")
+
+        if start_epoch > n_epochs:
+            self._log_line(f"[train] start_epoch({start_epoch}) > n_epochs({n_epochs}); nothing to do.")
+            if self.accelerator.is_main_process and self._run_log_path is not None:
+                self._log_line(f"[run] end_time={datetime.now().isoformat(timespec='seconds')}")
+            self._close_run_log()
+            return
+
+        remaining = int(n_epochs - start_epoch + 1)
+        with tqdm(range(start_epoch, n_epochs + 1), total=remaining, disable=False) as t:
             for epoch in t:
                 train_epoch_result_dict, global_step = self.train_one_epoch(
                     epoch, global_step
@@ -1798,18 +1978,18 @@ class QwenVLBCTrainer(BCTrainer):
             if state_dict is None:
                 state_dict = unwrapped_model.state_dict()
 
-            # Merge LoRA weights into the base weights for saving.
-            try:
-                merge_on_save = bool(self.args.get("vision_lora_merge_on_save", True))
-            except Exception:
-                merge_on_save = True
-            if merge_on_save and any(isinstance(k, str) and k.endswith(".lora_A") for k in state_dict.keys()):
+            # Merge LoRA weights into the base weights for saving (works for both vision/text LoRA).
+            if any(isinstance(k, str) and k.endswith(".lora_A") for k in state_dict.keys()):
                 try:
-                    r = int(self.args.get("vision_lora_r", 8))
-                    alpha = int(self.args.get("vision_lora_alpha", 16))
+                    merge_text = bool(self.args.get("text_lora_merge_on_save", True))
                 except Exception:
-                    r, alpha = 8, 16
-                state_dict = merge_and_strip_lora_from_state_dict(state_dict, r=r, alpha=alpha)
+                    merge_text = True
+                try:
+                    merge_vision = bool(self.args.get("vision_lora_merge_on_save", True))
+                except Exception:
+                    merge_vision = True
+                if merge_text or merge_vision:
+                    state_dict = merge_and_strip_lora_from_state_dict(state_dict)
 
             unwrapped_model.save_pretrained(
                 save_path,
